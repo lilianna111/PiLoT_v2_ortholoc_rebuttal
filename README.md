@@ -9,4 +9,4 @@
 4. 修改config/google.yaml中文件路径，包括dataset_path和checkpoint
 5. 执行./run.sh
 
-最后：cuda结束有可能报warning，残留multiprocess进程，需要手动kill掉# PiLoT_v2_ortholoc_rebuttal
+最后：cuda结束有可能报warning，残留multiprocess进程，需要手动kill掉

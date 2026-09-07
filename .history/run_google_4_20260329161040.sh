@@ -178,8 +178,8 @@ target_names=(
 # "USA_seq8@8@night@intensity1@500"
 # "USA_seq2@8@sunny@screen16@500"
 # "USA_seq2@8@sunny@screen8@500"
-"USA_seq2@8@foggy@intensity3@200"
-"USA_seq2@8@night@intensity3@200"
+# "USA_seq2@8@foggy@intensity3@200"
+# "USA_seq2@8@night@intensity3@200"
 # "USA_seq2@8@sunny@200"
 # "USA_seq2@8@cloudy@200"
 # "USA_seq2@8@sunset@200"
@@ -201,8 +201,8 @@ target_names=(
 # "switzerland_seq7@8@cloudy@500"  #!
 # "switzerland_seq7@8@rainy@500"
 # "switzerland_seq7@8@sunset@500"
-# "switzerland_seq7@8@foggy@intensity3@500"  #here
-# "switzerland_seq7@8@night@intensity3@500"
+"switzerland_seq7@8@foggy@intensity3@500"  #here
+"switzerland_seq7@8@night@intensity3@500"
 # "switzerland_seq7@8@foggy@intensity2@500"
 # "switzerland_seq7@8@night@intensity2@500"
 # "switzerland_seq7@8@foggy@intensity1@500"

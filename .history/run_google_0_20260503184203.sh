@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
 # run_by_names.sh
 
+set -euo pipefail
+
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+MAIN_PY="${SCRIPT_DIR}/main.py"
+CONFIG_PATH="${SCRIPT_DIR}/configs/google.yaml"
+CROP_K_JSON="${CROP_K_JSON:-${SCRIPT_DIR}/crop/K_google_1920_1080.json}"
+ORTHOLOC_INTRINSICS="${ORTHOLOC_INTRINSICS:-${SCRIPT_DIR}/OrthoLoC/OrthoLoC/google_intrinsics_1920_1080.json}"
+
+DOM_PATH="${DOM_PATH:-/home/amax/Downloads/wgs84/dom/usa2dom.tif}"
+DSM_PATH="${DSM_PATH:-/home/amax/Downloads/wgs84/dsm/usa2dsm.tif}"
+
+ORTHOLOC_MATCHER="${ORTHOLOC_MATCHER:-Mast3R}"
+ORTHOLOC_DEVICE="${ORTHOLOC_DEVICE:-cuda}"
+ORTHOLOC_ANGLES=(${ORTHOLOC_ANGLES:-0 90 180 270})
+GT_RESET_TRANSLATION_THRESH_M="${GT_RESET_TRANSLATION_THRESH_M:-20}"
+GT_RESET_ROTATION_THRESH_DEG="${GT_RESET_ROTATION_THRESH_DEG:-20}"
 
 # ==== 所有配置（names 作为 key） ====
 names=(
@@ -180,9 +198,9 @@ target_names=(
 # "USA_seq2@8@sunny@screen8@500"
 "USA_seq2@8@foggy@intensity3@200"
 "USA_seq2@8@night@intensity3@200"
-# "USA_seq2@8@sunny@200"
-# "USA_seq2@8@cloudy@200"
-# "USA_seq2@8@sunset@200"
+"USA_seq2@8@sunny@200"
+"USA_seq2@8@cloudy@200"
+"USA_seq2@8@sunset@200"
 # "USA_seq2@8@foggy@intensity1@500"
 # "USA_seq2@8@foggy@intensity3@500"
 # "USA_seq2@8@night@intensity3@500"
@@ -230,7 +248,7 @@ target_names=(
 # ==== 从 txt 中读取 init_euler 和 init_trans ====
 read_pose_from_file() {
   local name="$1"
-  local pose_file="/mnt/data1/UserData/liuxy/Mapscape/Test/poses/${name}.txt"
+  local pose_file="/media/amax/PS2000/Test/poses/${name}.txt"
   if [[ ! -f "$pose_file" ]]; then
     echo "❌ 找不到 pose 文件: $pose_file"
     return 1
@@ -273,19 +291,29 @@ for target_name in "${target_names[@]}"; do
     echo "euler : $euler"
     echo "trans : $trans"
 
-    echo "--- FPVLoc localization"
-    python /home/ps/Documents/liuxy24/PiLoT_v55/main.py \
-      --config "/home/ps/Documents/liuxy24/PiLoT_v55/configs/google.yaml" \
+    echo "--- crop + ortholoc"
+    python "$MAIN_PY" \
+      --config "$CONFIG_PATH" \
       --init_euler "$euler" \
       --init_trans "$trans" \
-      --name "$target_name"
+      --name "$target_name" \
+      --dom_path "$DOM_PATH" \
+      --dsm_path "$DSM_PATH" \
+      --crop_k_json "$CROP_K_JSON" \
+      --ortholoc_intrinsics "$ORTHOLOC_INTRINSICS" \
+      --ortholoc_matcher "$ORTHOLOC_MATCHER" \
+      --ortholoc_device "$ORTHOLOC_DEVICE" \
+      --ortholoc_angles "${ORTHOLOC_ANGLES[@]}" \
+      --gt_reset_translation_thresh_m "$GT_RESET_TRANSLATION_THRESH_M" \
+      --gt_reset_rotation_thresh_deg "$GT_RESET_ROTATION_THRESH_DEG" \
+      --continue_on_error
     # python /home/ubuntu/Documents/code/github/Target2loc/targetloc_raft_google_v2.py \
     #   --config "/home/ubuntu/Documents/code/github/Target2loc/configs/config_local_DJI_google_video_1920@1080.json" \
     #   --init_euler "$euler" \
     #   --init_trans "$trans" \
     #   --name "$target_name"
     
-    echo -e "==== raft 运行 $target_name 结束 ====\n"
+    echo -e "==== 运行 $target_name 结束 ====\n"
 
     # ps aux | grep multiprocessing.spawn | grep -v grep | awk '{print $2}' | xargs kill -9 || true
     # ps aux | grep multiprocessing.resource_tracker | grep -v grep | awk '{print $2}' | xargs kill -9 || true

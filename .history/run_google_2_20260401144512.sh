@@ -178,10 +178,10 @@ target_names=(
 # "USA_seq8@8@night@intensity1@500"
 # "USA_seq2@8@sunny@screen16@500"
 # "USA_seq2@8@sunny@screen8@500"
-"USA_seq2@8@foggy@intensity3@200"
-"USA_seq2@8@night@intensity3@200"
+# "USA_seq2@8@foggy@intensity3@200"
+# "USA_seq2@8@night@intensity3@200"
 # "USA_seq2@8@sunny@200"
-# "USA_seq2@8@cloudy@200"
+"USA_seq2@8@cloudy@200"
 # "USA_seq2@8@sunset@200"
 # "USA_seq2@8@foggy@intensity1@500"
 # "USA_seq2@8@foggy@intensity3@500"
@@ -230,7 +230,7 @@ target_names=(
 # ==== 从 txt 中读取 init_euler 和 init_trans ====
 read_pose_from_file() {
   local name="$1"
-  local pose_file="/mnt/data1/UserData/liuxy/Mapscape/Test/poses/${name}.txt"
+  local pose_file="/media/amax/AE0E2AFD0E2ABE69/datasets/mapscape/poses/${name}.txt"
   if [[ ! -f "$pose_file" ]]; then
     echo "❌ 找不到 pose 文件: $pose_file"
     return 1
@@ -274,8 +274,8 @@ for target_name in "${target_names[@]}"; do
     echo "trans : $trans"
 
     echo "--- FPVLoc localization"
-    python /home/ps/Documents/liuxy24/PiLoT_v55/main.py \
-      --config "/home/ps/Documents/liuxy24/PiLoT_v55/configs/google.yaml" \
+    python /home/amax/Documents/code/lxy/PiLoT_v55/main_google_0401.py \
+      --config "/home/amax/Documents/code/lxy/PiLoT_v55/configs/google.yaml" \
       --init_euler "$euler" \
       --init_trans "$trans" \
       --name "$target_name"

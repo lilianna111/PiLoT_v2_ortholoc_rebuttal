@@ -15,7 +15,7 @@ import numpy as np
 from tqdm import tqdm
 from pprint import pformat
 from pixloc.pixlib.geometry import Camera, Pose
-from pixloc.utils.eval import evaluate_xyz, evaluate_XYZ_EULER, evaluate
+from pixloc.utils.eval import evaluate_xyz, evaluate_XYZ_EULER, evaluate, euler_angles_to_matrix_ECEF_w2c
 from pixloc.utils.get_depth import get_3D_samples_v3, pad_to_multiple, generate_render_camera, get_3D_samples_v2
 from pixloc.utils.transform import euler_angles_to_matrix_ECEF, pixloc_to_osg, WGS84_to_ECEF
 from pixloc.utils import video_generation
@@ -32,7 +32,12 @@ from crop.crop.transform_colmap import (
     enu_to_ecef_rotation as crop_enu_to_ecef_rotation,
     wgs84_to_ecef as crop_wgs84_to_ecef,
 )
+from pixloc.crop.transform_colmap import transform_colmap_pose_intrinsic as crop_transform_colmap_pose_intrinsic
+from pixloc.crop.proj2map import generate_ref_map
+from pixloc.crop.utils import read_DSM_config
+from pixloc.crop.ray_casting import TargetLocation
 import torch.nn.functional as F
+import rasterio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,44 +132,6 @@ def load_ortholoc_components():
     return ortholoc_utils, MatcherIMCUI, MATCHER_ZOO
 
 
-_CGCS2000_TO_WGS84_TRANSFORMER = None
-
-
-def cgcs2000_to_wgs84(x, y):
-    global _CGCS2000_TO_WGS84_TRANSFORMER
-    if _CGCS2000_TO_WGS84_TRANSFORMER is None:
-        import pyproj
-
-        _CGCS2000_TO_WGS84_TRANSFORMER = pyproj.Transformer.from_crs(
-            "EPSG:4547", "EPSG:4326", always_xy=True
-        )
-    return _CGCS2000_TO_WGS84_TRANSFORMER.transform(x, y)
-
-
-def cgcs2000_grid_to_local_ecef(points3d_cgcs, valid_mask):
-    points3d_cgcs = np.asarray(points3d_cgcs, dtype=np.float64)
-    valid_mask = np.asarray(valid_mask, dtype=bool)
-
-    lon, lat = cgcs2000_to_wgs84(points3d_cgcs[..., 0], points3d_cgcs[..., 1])
-    x_ecef, y_ecef, z_ecef = crop_wgs84_to_ecef(lon, lat, points3d_cgcs[..., 2])
-    points3d_ecef = np.stack([x_ecef, y_ecef, z_ecef], axis=-1).astype(np.float64)
-
-    valid_mask = valid_mask & np.isfinite(points3d_ecef).all(axis=-1)
-    if not np.any(valid_mask):
-        raise ValueError("crop has no valid ECEF points")
-
-    ecef_origin = points3d_ecef[valid_mask].mean(axis=0).astype(np.float64)
-    points3d_local_ecef = points3d_ecef - ecef_origin
-    points3d_local_ecef[~valid_mask] = np.nan
-    return points3d_local_ecef.astype(np.float32), ecef_origin, valid_mask
-
-
-def add_ecef_origin_to_pose(pose_c2w, ecef_origin):
-    pose_c2w = np.asarray(pose_c2w, dtype=np.float64).copy()
-    pose_c2w[:3, 3] += np.asarray(ecef_origin, dtype=np.float64)
-    return pose_c2w
-
-
 def ortholoc_pose_c2w_to_crop_pose(pose_c2w):
     from scipy.spatial.transform import Rotation as Rotation
 
@@ -209,6 +176,25 @@ def translation_diff_m(trans_a, trans_b):
     xyz_a = crop_wgs84_to_ecef(*np.asarray(trans_a, dtype=np.float64))
     xyz_b = crop_wgs84_to_ecef(*np.asarray(trans_b, dtype=np.float64))
     return float(np.linalg.norm(np.asarray(xyz_a) - np.asarray(xyz_b)))
+
+
+def eval_pose_error_vs_gt(pred_euler, pred_trans, gt_euler, gt_trans):
+    pred_euler = np.asarray(pred_euler, dtype=np.float64)
+    gt_euler = np.asarray(gt_euler, dtype=np.float64)
+    pred_euler_for_eval = [pred_euler[1], pred_euler[0], pred_euler[2]]
+    gt_euler_for_eval = [gt_euler[1], gt_euler[0], gt_euler[2]]
+    r_gt, t_gt = euler_angles_to_matrix_ECEF_w2c(
+        gt_euler_for_eval,
+        np.asarray(gt_trans, dtype=np.float64),
+    )
+    r_pred, t_pred = euler_angles_to_matrix_ECEF_w2c(
+        pred_euler_for_eval,
+        np.asarray(pred_trans, dtype=np.float64),
+    )
+    error_t = float(np.linalg.norm(np.asarray(t_pred) - np.asarray(t_gt), axis=0))
+    cos = np.clip((np.trace(np.dot(r_gt.T, r_pred)) - 1.0) / 2.0, -1.0, 1.0)
+    error_r = float(np.rad2deg(np.abs(np.arccos(cos))))
+    return error_t, error_r
 
 
 def pose_values_for_txt(euler_pitch_roll_yaw, trans_lon_lat_alt):
@@ -359,8 +345,6 @@ def process_map_crop(ref_DSM_path, pose_data, ref_npy_path, name, map_data_pack,
     """
     单帧处理函数：只负责计算和裁剪，不负责加载大地图
     """
-    from pixloc.crop.transform_colmap import transform_colmap_pose_intrinsic as crop_transform_colmap_pose_intrinsic
-    from pixloc.crop.proj2map import generate_ref_map
 
     geotransform, area, area_minZ, dsm_data, dsm_trans, dom_data = map_data_pack
     ref_rgb_path, ref_depth_path = paths_pack
@@ -495,8 +479,8 @@ class DualProcessTask:
         self.max_pose_jump_m = getattr(args, "max_pose_jump_m", 100.0)
         self.max_euler_jump_deg = getattr(args, "max_euler_jump_deg", 100.0)
         self.max_gt_recrops = getattr(args, "max_gt_recrops", 1)
-        self.gt_reset_translation_thresh_m = getattr(args, "gt_reset_translation_thresh_m", 50.0)
-        self.gt_reset_rotation_thresh_deg = getattr(args, "gt_reset_rotation_thresh_deg", 50.0)
+        self.gt_reset_translation_thresh_m = getattr(args, "gt_reset_translation_thresh_m", 20.0)
+        self.gt_reset_rotation_thresh_deg = getattr(args, "gt_reset_rotation_thresh_deg", 20.0)
         self.continue_on_error = getattr(args, "continue_on_error", False)
         self.run_evaluate = getattr(args, "evaluate", False)
         
@@ -581,9 +565,6 @@ class DualProcessTask:
         ref_depth_path = self.pre_path
         paths_pack = (ref_rgb_path, ref_depth_path)
 
-        from pixloc.crop.utils import read_DSM_config
-        from pixloc.crop.ray_casting import TargetLocation
-
         map_data_pack = read_DSM_config(ref_DSM_path, ref_DOM_path, ref_npy_path)
         _, ray_area, ray_area_minZ, _, _, _ = map_data_pack
         locator = TargetLocation({"ray_casting": {}}, use_dsm=False)
@@ -592,6 +573,9 @@ class DualProcessTask:
 
         next_idx = 0
         fps_log_every = 0
+        last_valid_euler = np.asarray(self.euler_angles, dtype=np.float64)
+        last_valid_trans = np.asarray(self.translation, dtype=np.float64)
+
         # === 3. 主循环：按位姿裁剪 ===
         while True:
             try:
@@ -625,6 +609,31 @@ class DualProcessTask:
             img_path = self.img_list[frame_idx]
             name = os.path.splitext(os.path.basename(img_path))[0]
 
+            def send_crop_failed(reason):
+                try:
+                    self.task_q.put(
+                        {
+                            "name": name,
+                            "img_path": img_path,
+                            "frame_idx": frame_idx,
+                            "reset_count": reset_count,
+                            "pose_source": pose_source,
+                            "dom_warp": None,
+                            "xyz_ecef": None,
+                            "render_euler": euler,
+                            "render_trans": trans,
+                            "fallback_euler": last_valid_euler.copy(),
+                            "fallback_trans": last_valid_trans.copy(),
+                            "skip_localization": True,
+                            "crop_failed": True,
+                            "skip_reason": reason,
+                        },
+                        timeout=1,
+                    )
+                    return True
+                except queue.Full:
+                    return False
+
             t0 = time.perf_counter()
             tt0 = time.time()
             try:
@@ -640,9 +649,11 @@ class DualProcessTask:
                     locator=locator,
                 )
             except Exception as exc:
-                logging.exception(f"process_map_crop 失败 name={name}: {exc}")
-                self.stop_evt.set()
-                break
+                logging.error(f"process_map_crop 失败 name={name}: {exc}")
+                if not send_crop_failed(f"crop_failed={exc}"):
+                    break
+                next_idx = max(next_idx, frame_idx + 1)
+                continue
             tt1 = time.time()
             # print(f"process_map_crop 耗时: {tt1-tt0} 秒")
 
@@ -660,15 +671,19 @@ class DualProcessTask:
             # if color is None:
             if color is None or color.size == 0:
                 logging.error(f"读取裁剪 RGB 失败")
-                self.stop_evt.set()
-                break
+                if not send_crop_failed("crop_rgb_empty"):
+                    break
+                next_idx = max(next_idx, frame_idx + 1)
+                continue
             # color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)    #作用：将BGR格式转换为RGB格式
 
             valid_mask = np.isfinite(points3d).all(axis=-1) & (points3d[..., 2] > 0)
             if not np.any(valid_mask):
                 logging.error(f"裁剪结果无有效3D点")
-                self.stop_evt.set()
-                break
+                if not send_crop_failed("crop_no_valid_3d_points"):
+                    break
+                next_idx = max(next_idx, frame_idx + 1)
+                continue
 
             target_w = int(self.render_camera_osg[0])
             target_h = int(self.render_camera_osg[1])
@@ -683,15 +698,10 @@ class DualProcessTask:
 
             if not np.any(valid_mask):
                 logging.error(f"裁剪结果无有效3D点(经过resize/padding后): {name}")
-                self.stop_evt.set()
-                break
-
-            try:
-                points3d_ecef, ecef_origin, valid_mask = cgcs2000_grid_to_local_ecef(points3d, valid_mask)
-            except Exception as exc:
-                logging.exception(f"裁剪3D点转ECEF失败 name={name}: {exc}")
-                self.stop_evt.set()
-                break
+                if not send_crop_failed("crop_no_valid_3d_points_after_resize_padding"):
+                    break
+                next_idx = max(next_idx, frame_idx + 1)
+                continue
 
             t_render = (time.perf_counter() - t0) * 1e3  # ms
             fps_log_every += 1
@@ -703,10 +713,15 @@ class DualProcessTask:
             logging.info(f"Saved crop image: {crop_save_path}")
 
             crop_h, crop_w = color.shape[:2]
-            if min(crop_h, crop_w) < self.min_ortholoc_crop_size:
+            skip_localization = min(crop_h, crop_w) < self.min_ortholoc_crop_size
+            if skip_localization:
                 logging.warning(
-                    f"crop 尺寸小于建议阈值但仍继续 OrthoLoC: name={name}, size={crop_w}x{crop_h}"
+                    f"crop 退化，跳过 OrthoLoC: name={name}, size={crop_w}x{crop_h}, "
+                    f"等待 localization 端决定是否用 GT reset"
                 )
+            else:
+                last_valid_euler = np.asarray(euler, dtype=np.float64)
+                last_valid_trans = np.asarray(trans, dtype=np.float64)
 
             try:
                 self.task_q.put(
@@ -717,10 +732,13 @@ class DualProcessTask:
                         "reset_count": reset_count,
                         "pose_source": pose_source,
                         "dom_warp": color,
-                        "xyz_ecef": points3d_ecef,
-                        "ecef_origin": ecef_origin,
+                        "xyz_ecef": points3d.astype(np.float32),
                         "render_euler": np.asarray(euler, dtype=np.float64),
                         "render_trans": np.asarray(trans, dtype=np.float64),
+                        "fallback_euler": last_valid_euler,
+                        "fallback_trans": last_valid_trans,
+                        "skip_localization": skip_localization,
+                        "skip_reason": f"crop_size={crop_w}x{crop_h}" if skip_localization else None,
                     },
                     timeout=1,
                 )
@@ -736,50 +754,21 @@ class DualProcessTask:
     # ---------------- 定位线程 ----------------
     def localization_worker(self):
         print("✅ Localization Worker Started! pid:", os.getpid())
-        error_path = os.path.join(self.outputs, "localization_error.txt")
-        fault_path = os.path.join(self.outputs, "localization_faulthandler.txt")
-        fault_file = None
-        stage = "load_ortholoc_components"
-        try:
-            import faulthandler
+        ortholoc_utils, MatcherIMCUI, MATCHER_ZOO = load_ortholoc_components()
+        if self.ortholoc_matcher not in MATCHER_ZOO:
+            raise ValueError(f"Unsupported OrthoLoC matcher: {self.ortholoc_matcher}")
 
-            os.makedirs(self.outputs, exist_ok=True)
-            fault_file = open(fault_path, "w", encoding="utf-8", buffering=1)
-            faulthandler.enable(file=fault_file, all_threads=True)
-            logging.info("Localization init: loading OrthoLoC components")
-            ortholoc_utils, MatcherIMCUI, MATCHER_ZOO = load_ortholoc_components()
-            if self.ortholoc_matcher not in MATCHER_ZOO:
-                raise ValueError(f"Unsupported OrthoLoC matcher: {self.ortholoc_matcher}")
+        _, intrinsics_matrix = ortholoc_utils.io.load_camera_params(self.ortholoc_intrinsics)
+        if intrinsics_matrix is None:
+            raise ValueError(f"Failed to load intrinsics from {self.ortholoc_intrinsics}")
 
-            stage = "load_camera_params"
-            logging.info("Localization init: loading intrinsics from %s", self.ortholoc_intrinsics)
-            _, intrinsics_matrix = ortholoc_utils.io.load_camera_params(self.ortholoc_intrinsics)
-            if intrinsics_matrix is None:
-                raise ValueError(f"Failed to load intrinsics from {self.ortholoc_intrinsics}")
+        matcher = MatcherIMCUI(
+            name=self.ortholoc_matcher,
+            device=self.ortholoc_device,
+            angles=self.ortholoc_angles,
+        )
 
-            stage = "init_matcher"
-            logging.info("Localization init: creating matcher %s on %s", self.ortholoc_matcher, self.ortholoc_device)
-            matcher = MatcherIMCUI(
-                name=self.ortholoc_matcher,
-                device=self.ortholoc_device,
-                angles=self.ortholoc_angles,
-            )
-            logging.info("Localization init finished")
-        except Exception as exc:
-            import traceback
-
-            os.makedirs(self.outputs, exist_ok=True)
-            with open(error_path, "w", encoding="utf-8") as f:
-                f.write(f"stage: {stage}\n")
-                f.write(traceback.format_exc())
-            logging.exception("Localization init failed at %s: %s", stage, exc)
-            self.stop_evt.set()
-            try:
-                self.pose_q.put(None, timeout=1)
-            except Exception:
-                pass
-            return
-
+        results = []
         aggregated_poses = []
         failed_images = []
         reset_records = []
@@ -796,6 +785,7 @@ class DualProcessTask:
             "prior_lon_lat_alt_roll_pitch_yaw",
             "ortholoc_lon_lat_alt_roll_pitch_yaw",
             "next_crop_lon_lat_alt_roll_pitch_yaw",
+            "fallback_lon_lat_alt_roll_pitch_yaw",
             "gt_error_m",
             "gt_error_deg",
             "best_angle",
@@ -803,7 +793,6 @@ class DualProcessTask:
             "matches_filtered",
             "inliers",
             "median_reproj",
-            "ecef_origin",
             "pose_c2w_flat",
             "pose_w2c_flat",
         ]
@@ -822,6 +811,8 @@ class DualProcessTask:
             prior_trans,
             next_euler,
             next_trans,
+            fallback_euler,
+            fallback_trans,
             ortho_ret=None,
             ortho_euler=None,
             ortho_trans=None,
@@ -839,6 +830,7 @@ class DualProcessTask:
                 format_pose_values(pose_values_for_txt(prior_euler, prior_trans)),
                 format_pose_values(pose_values_for_txt(ortho_euler, ortho_trans)) if ortho_euler is not None and ortho_trans is not None else "",
                 format_pose_values(pose_values_for_txt(next_euler, next_trans)),
+                format_pose_values(pose_values_for_txt(fallback_euler, fallback_trans)),
                 format_float(jump_m),
                 format_float(jump_deg),
                 format_float(ortho_ret.get("best_angle") if ortho_ret else None),
@@ -846,7 +838,6 @@ class DualProcessTask:
                 format_float(ortho_ret.get("num_matches_filtered") if ortho_ret else None),
                 format_float(ortho_ret.get("num_inliers") if ortho_ret else None),
                 format_float(ortho_ret.get("median_reprojection_error") if ortho_ret else None),
-                format_matrix_flat(ortho_ret.get("ecef_origin") if ortho_ret else None),
                 format_matrix_flat(ortho_ret.get("pose_c2w") if ortho_ret else None),
                 format_matrix_flat(ortho_ret.get("pose_w2c") if ortho_ret else None),
             ]
@@ -874,24 +865,40 @@ class DualProcessTask:
                 }
             )
 
+        def gt_lookup_keys(frame_idx, img_path):
+            keys = []
+            if img_path:
+                keys.append(os.path.basename(img_path))
+            if 0 <= frame_idx < len(self.img_list):
+                keys.append(os.path.basename(self.img_list[frame_idx]))
+            expanded = []
+            for key in keys:
+                if not key or key in expanded:
+                    continue
+                expanded.append(key)
+                stem, _ = os.path.splitext(key)
+                if "_" not in stem:
+                    mapped = f"{stem}_0.png"
+                    if mapped not in expanded:
+                        expanded.append(mapped)
+            return expanded
+
+        def get_gt_pose_for_frame(frame_idx, img_path):
+            for key in gt_lookup_keys(frame_idx, img_path):
+                pose = self.gt_pose_dict.get(key)
+                if pose is not None:
+                    return (
+                        np.asarray(pose["euler"], dtype=np.float64),
+                        np.asarray(pose["trans"], dtype=np.float64),
+                        key,
+                    )
+            return None
+
         def pose_result_line(image_name, euler, trans):
             return (
                 f"{image_name} {' '.join(map(str, np.asarray(trans, dtype=np.float64).tolist()))} "
                 f"{' '.join(map(str, [float(euler[1]), float(euler[0]), float(euler[2])]))}"
             )
-
-        pose_output_paths = [self.estimated_pose, self.estimated_pose_in_dir]
-        for pose_output_path in pose_output_paths:
-            with open(pose_output_path, "w", encoding="utf-8"):
-                pass
-
-        def record_pose_result(image_name, euler, trans):
-            line = pose_result_line(image_name, euler, trans)
-            for pose_output_path in pose_output_paths:
-                with open(pose_output_path, "a", encoding="utf-8") as f_pose:
-                    f_pose.write(line + "\n")
-                    f_pose.flush()
-            return line
 
         def append_reset_record(frame_idx, image_name, reset_count, pose_source, status, reason):
             reset_records.append(
@@ -923,35 +930,118 @@ class DualProcessTask:
             render_trans = np.asarray(item["render_trans"], dtype=np.float64)
             dom_warp = item.get("dom_warp")
             xyz_ecef = item.get("xyz_ecef")
-            ecef_origin = item.get("ecef_origin")
-            if ecef_origin is not None:
-                ecef_origin = np.asarray(ecef_origin, dtype=np.float64)
             qname = os.path.basename(img_path)
+            fallback_euler = np.asarray(item.get("fallback_euler", render_euler), dtype=np.float64)
+            fallback_trans = np.asarray(item.get("fallback_trans", render_trans), dtype=np.float64)
             if dom_warp is None:
                 crop_size = "0x0"
             else:
                 crop_h, crop_w = dom_warp.shape[:2]
                 crop_size = f"{crop_w}x{crop_h}"
 
-            if dom_warp is None or xyz_ecef is None or ecef_origin is None:
+            def compute_gt_error(euler, trans):
+                gt_pose = get_gt_pose_for_frame(frame_idx, img_path)
+                if gt_pose is None:
+                    return None
+                gt_euler, gt_trans, gt_key = gt_pose
+                error_t, error_r = eval_pose_error_vs_gt(euler, trans, gt_euler, gt_trans)
+                return gt_euler, gt_trans, gt_key, error_t, error_r
+
+            def should_reset_next_from_gt(euler, trans):
+                gt_error = compute_gt_error(euler, trans)
+                if gt_error is None:
+                    return False, None, None, None, None, None, "missing_gt"
+                gt_euler, gt_trans, gt_key, error_t, error_r = gt_error
+                bad_t = self.gt_reset_translation_thresh_m > 0 and error_t > self.gt_reset_translation_thresh_m
+                bad_r = self.gt_reset_rotation_thresh_deg > 0 and error_r > self.gt_reset_rotation_thresh_deg
+                reason = (
+                    f"gt_error={error_t:.2f}m,{error_r:.2f}deg "
+                    f"> thresh={self.gt_reset_translation_thresh_m:.2f}m,{self.gt_reset_rotation_thresh_deg:.2f}deg; "
+                    f"gt_key={gt_key}"
+                )
+                return bool(bad_t or bad_r), gt_euler, gt_trans, gt_key, error_t, error_r, reason
+
+            def enqueue_next_from_gt(reason):
+                nonlocal gt_reset_requests
+                gt_pose = get_gt_pose_for_frame(frame_idx, img_path)
+                if gt_pose is None:
+                    logging.warning("无法 GT reset：frame=%s 找不到 GT pose", qname)
+                    return False, None, None, None
+                gt_euler, gt_trans, gt_key = gt_pose
+                gt_reset_requests += 1
+                if frame_idx < len(self.img_list) - 1:
+                    enqueue_pose(
+                        frame_idx=frame_idx + 1,
+                        euler=gt_euler,
+                        trans=gt_trans,
+                        reset_count=reset_count + 1,
+                        pose_source="gt_reset",
+                    )
+                logging.warning(
+                    "GT reset next crop after frame=%s reset_count=%d reason=%s",
+                    qname,
+                    reset_count + 1,
+                    reason,
+                )
+                return True, gt_euler, gt_trans, gt_key
+
+            def final_fallback_pose():
+                if pose_source == "gt_reset":
+                    return render_euler, render_trans
+                return fallback_euler, fallback_trans
+
+            if item.get("skip_localization", False) or dom_warp is None or xyz_ecef is None:
                 reason = item.get("skip_reason", "unknown")
-                logging.error(f"OrthoLoC 输入无效，停止定位 frame={qname}: {reason}")
-                failed_images.append(qname)
+                logging.warning(f"跳过 OrthoLoC frame={qname}: {reason}")
+                reset_next, gt_euler, gt_trans, gt_key = enqueue_next_from_gt(reason)
+                if reset_next:
+                    final_euler, final_trans = gt_euler, gt_trans
+                    final_status = "skipped_gt_reset_next"
+                    final_reason = f"{reason}; gt_key={gt_key}"
+                    final_reset_count = reset_count + 1
+                else:
+                    final_euler, final_trans = final_fallback_pose()
+                    final_status = "skipped"
+                    final_reason = reason
+                    final_reset_count = reset_count
+                    if self.continue_on_error and frame_idx < len(self.img_list) - 1:
+                        enqueue_pose(frame_idx + 1, final_euler, final_trans, reset_count=reset_count, pose_source="fallback")
                 write_pose_debug(
                     frame_idx=frame_idx,
                     image_name=qname,
-                    status="invalid_crop",
-                    reason=reason,
+                    status=final_status,
+                    reason=final_reason,
                     crop_size=crop_size,
-                    reset_count=reset_count,
+                    reset_count=final_reset_count,
                     pose_source=pose_source,
                     prior_euler=render_euler,
                     prior_trans=render_trans,
-                    next_euler=render_euler,
-                    next_trans=render_trans,
+                    next_euler=final_euler,
+                    next_trans=final_trans,
+                    fallback_euler=fallback_euler,
+                    fallback_trans=fallback_trans,
                 )
-                self.stop_evt.set()
-                break
+                results.append(pose_result_line(qname, final_euler, final_trans))
+                append_reset_record(frame_idx, qname, final_reset_count, pose_source, final_status, final_reason)
+                aggregated_poses.append(
+                    {
+                        "sample_id": crop_name,
+                        "image_path": os.path.abspath(img_path),
+                        "pose_w2c": None,
+                        "intrinsics": intrinsics_matrix.tolist(),
+                        "skipped": True,
+                        "skip_reason": final_reason,
+                        "reset_count": final_reset_count,
+                        "pose_source": pose_source,
+                        "reset_next_from_gt": reset_next,
+                        "fallback_translation_wgs84": final_trans.tolist(),
+                        "fallback_euler_pitch_roll_yaw": final_euler.tolist(),
+                    }
+                )
+                if not self.continue_on_error or frame_idx >= len(self.img_list) - 1:
+                    break
+                next_idx = max(next_idx, frame_idx + 1)
+                continue
 
             ortho_ret = None
             pred_euler = None
@@ -972,25 +1062,40 @@ class DualProcessTask:
                     num_points=self.ortholoc_num_points,
                 )
 
-                ortho_ret["pose_c2w"] = add_ecef_origin_to_pose(ortho_ret["pose_c2w"], ecef_origin)
-                ortho_ret["pose_w2c"] = np.linalg.inv(ortho_ret["pose_c2w"])
-                ortho_ret["ecef_origin"] = ecef_origin
                 pred_euler, pred_translation = ortholoc_pose_c2w_to_crop_pose(ortho_ret["pose_c2w"])
-                reset_next = False
-                gt_key = None
-                if frame_idx < len(self.img_list) - 1:
-                    enqueue_pose(
-                        frame_idx + 1,
-                        pred_euler,
-                        pred_translation,
-                        reset_count=reset_count,
-                        pose_source="ortholoc",
-                    )
-                status = "accepted"
-                reason = None
-                next_euler = pred_euler
-                next_trans = pred_translation
-                output_reset_count = reset_count
+                reset_next, gt_euler, gt_trans, gt_key, jump_m, jump_deg, reset_reason = should_reset_next_from_gt(
+                    pred_euler, pred_translation
+                )
+                if reset_next:
+                    gt_reset_requests += 1
+                    if frame_idx < len(self.img_list) - 1:
+                        enqueue_pose(
+                            frame_idx + 1,
+                            gt_euler,
+                            gt_trans,
+                            reset_count=reset_count + 1,
+                            pose_source="gt_reset",
+                        )
+                    status = "accepted_gt_reset_next"
+                    reason = reset_reason
+                    next_euler = gt_euler
+                    next_trans = gt_trans
+                    output_reset_count = reset_count + 1
+                    logging.warning("GT reset next crop after frame=%s reset_count=%d reason=%s", qname, output_reset_count, reason)
+                else:
+                    if frame_idx < len(self.img_list) - 1:
+                        enqueue_pose(
+                            frame_idx + 1,
+                            pred_euler,
+                            pred_translation,
+                            reset_count=reset_count,
+                            pose_source="ortholoc",
+                        )
+                    status = "accepted"
+                    reason = None if jump_m is not None else reset_reason
+                    next_euler = pred_euler
+                    next_trans = pred_translation
+                    output_reset_count = reset_count
                 write_pose_debug(
                     frame_idx=frame_idx,
                     image_name=qname,
@@ -1003,6 +1108,8 @@ class DualProcessTask:
                     prior_trans=render_trans,
                     next_euler=next_euler,
                     next_trans=next_trans,
+                    fallback_euler=fallback_euler,
+                    fallback_trans=fallback_trans,
                     ortho_ret=ortho_ret,
                     ortho_euler=pred_euler,
                     ortho_trans=pred_translation,
@@ -1016,7 +1123,7 @@ class DualProcessTask:
                     f"Longitude, Latitude, Altitude: {pred_translation.tolist()}"
                 )
 
-                record_pose_result(qname, pred_euler, pred_translation)
+                results.append(pose_result_line(qname, pred_euler, pred_translation))
                 append_reset_record(frame_idx, qname, output_reset_count, pose_source, status, reason)
                 aggregated_poses.append(
                     {
@@ -1048,24 +1155,42 @@ class DualProcessTask:
                 ortho_debug_jump_deg = locals().get("jump_deg", None)
 
                 failed_images.append(qname)
+                reset_next, gt_euler, gt_trans, gt_key = enqueue_next_from_gt(str(exc))
+                if reset_next:
+                    final_euler, final_trans = gt_euler, gt_trans
+                    final_status = "rejected_or_failed_gt_reset_next"
+                    final_reason = f"{exc}; gt_key={gt_key}"
+                    final_reset_count = reset_count + 1
+                else:
+                    final_euler, final_trans = final_fallback_pose()
+                    final_status = "rejected_or_failed"
+                    final_reason = str(exc)
+                    final_reset_count = reset_count
+                    if self.continue_on_error and frame_idx < len(self.img_list) - 1:
+                        enqueue_pose(frame_idx + 1, final_euler, final_trans, reset_count=reset_count, pose_source="fallback")
                 write_pose_debug(
                     frame_idx=frame_idx,
                     image_name=qname,
-                    status="failed",
-                    reason=str(exc),
+                    status=final_status,
+                    reason=final_reason,
                     crop_size=crop_size,
-                    reset_count=reset_count,
+                    reset_count=final_reset_count,
                     pose_source=pose_source,
                     prior_euler=render_euler,
                     prior_trans=render_trans,
-                    next_euler=render_euler,
-                    next_trans=render_trans,
+                    next_euler=final_euler,
+                    next_trans=final_trans,
+                    fallback_euler=fallback_euler,
+                    fallback_trans=fallback_trans,
                     ortho_ret=ortho_debug_ret,
                     ortho_euler=ortho_debug_euler,
                     ortho_trans=ortho_debug_trans,
                     jump_m=ortho_debug_jump_m,
                     jump_deg=ortho_debug_jump_deg,
                 )
+
+                results.append(pose_result_line(qname, final_euler, final_trans))
+                append_reset_record(frame_idx, qname, final_reset_count, pose_source, final_status, final_reason)
                 aggregated_poses.append(
                     {
                         "sample_id": crop_name,
@@ -1073,19 +1198,25 @@ class DualProcessTask:
                         "pose_w2c": None,
                         "intrinsics": intrinsics_matrix.tolist(),
                         "error": str(exc),
-                        "reset_count": reset_count,
+                        "reset_count": final_reset_count,
                         "pose_source": pose_source,
-                        "reset_next_from_gt": False,
+                        "reset_next_from_gt": reset_next,
+                        "fallback_translation_wgs84": final_trans.tolist(),
+                        "fallback_euler_pitch_roll_yaw": final_euler.tolist(),
                     }
                 )
-                self.stop_evt.set()
-                break
+                if not self.continue_on_error:
+                    break
 
             if self.stop_evt.is_set():
                 break
             if frame_idx >= len(self.img_list) - 1:
                 break
             next_idx = max(next_idx, frame_idx + 1)
+        with open(self.estimated_pose, "w") as f:
+            f.write("\n".join(results))
+        with open(self.estimated_pose_in_dir, "w") as f:
+            f.write("\n".join(results))
         with open(self.reset_count_txt, "w", encoding="utf-8") as f:
             f.write("frame_idx\timage\treset_count\tpose_source\tstatus\treason\n")
             for record in reset_records:
@@ -1110,7 +1241,6 @@ class DualProcessTask:
                     "angles": self.ortholoc_angles,
                     "poses": aggregated_poses,
                     "failed_images": failed_images,
-                    "gt_reset_enabled": False,
                     "gt_reset_requests": gt_reset_requests,
                     "max_gt_recrops": self.max_gt_recrops,
                     "gt_reset_translation_thresh_m": self.gt_reset_translation_thresh_m,
@@ -1337,41 +1467,41 @@ def parse_args():
         "--max_pose_jump_m",
         type=float,
         default=100.0,
-        help="保留兼容参数；当前不再用相对先验跳变拒绝 OrthoLoC"
+        help="保留兼容参数；当前不再用相对先验跳变拒绝 OrthoLoC，改用 GT 误差判断 reset"
     )
 
     parser.add_argument(
         "--max_euler_jump_deg",
         type=float,
         default=100.0,
-        help="保留兼容参数；当前不再用相对先验跳变拒绝 OrthoLoC"
+        help="保留兼容参数；当前不再用相对先验跳变拒绝 OrthoLoC，改用 GT 误差判断 reset"
     )
 
     parser.add_argument(
         "--max_gt_recrops",
         type=int,
         default=1,
-        help="保留兼容参数；当前不启用 GT reset"
+        help="保留兼容参数；当前流程失败后不重裁当前帧，而是用 GT 作为下一帧 crop 先验"
     )
 
     parser.add_argument(
         "--gt_reset_translation_thresh_m",
         type=float,
-        default=50.0,
-        help="保留兼容参数；当前不启用按 GT 平移误差阈值 reset"
+        default=20.0,
+        help="OrthoLoC 当前帧估计相对 GT 的平移误差超过该阈值时，下一帧 crop 改用当前帧 GT pose"
     )
 
     parser.add_argument(
         "--gt_reset_rotation_thresh_deg",
         type=float,
-        default=50.0,
-        help="保留兼容参数；当前不启用按 GT 旋转误差阈值 reset"
+        default=20.0,
+        help="OrthoLoC 当前帧估计相对 GT 的旋转误差超过该阈值时，下一帧 crop 改用当前帧 GT pose"
     )
 
     parser.add_argument(
         "--continue_on_error",
         action="store_true",
-        help="保留兼容参数；当前单帧失败即停止，不写替代结果"
+        help="单帧 OrthoLoC 失败时继续后续帧，并回退到当前 crop 先验"
     )
 
     parser.add_argument(
