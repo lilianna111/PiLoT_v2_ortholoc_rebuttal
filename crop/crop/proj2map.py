@@ -81,13 +81,13 @@ def save_crop_debug_overlay(dom_array, hit_rc_list, save_path):
 
 def compute_min_valid_dsm_height(dsm_array: np.ndarray, dsm_nodata):
     valid = np.isfinite(dsm_array)
-    valid &= (dsm_array > 0)
+    valid &= (dsm_array > -9990)
 
     if dsm_nodata is not None:
         valid &= ~np.isclose(dsm_array, dsm_nodata)
 
     if not np.any(valid):
-        raise RuntimeError("DSM has no valid height > 0 for fallback.")
+        raise RuntimeError("DSM has no valid finite height for fallback.")
 
     min_h = float(np.min(dsm_array[valid]))
     # print(f"[DEBUG] min_valid_dsm_height = {min_h:.6f}")

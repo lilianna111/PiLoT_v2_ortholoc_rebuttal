@@ -181,7 +181,7 @@ target_names=(
 # "USA_seq2@8@foggy@intensity3@200"
 # "USA_seq2@8@night@intensity3@200"
 # "USA_seq2@8@sunny@200"
-# "USA_seq2@8@cloudy@200"
+"USA_seq2@8@cloudy@200"
 # "USA_seq2@8@sunset@200"
 # "USA_seq2@8@foggy@intensity1@500"
 # "USA_seq2@8@foggy@intensity3@500"
@@ -196,7 +196,7 @@ target_names=(
 # "switzerland_seq7@8@sunny@200"
 # "switzerland_seq7@8@cloudy@200" #!
 # "switzerland_seq7@8@sunset@200"
-"switzerland_seq7@8@rainy@200"
+# "switzerland_seq7@8@rainy@200"
 # "switzerland_seq7@8@sunny@500"
 # "switzerland_seq7@8@cloudy@500"  #!
 # "switzerland_seq7@8@rainy@500"
@@ -230,7 +230,7 @@ target_names=(
 # ==== 从 txt 中读取 init_euler 和 init_trans ====
 read_pose_from_file() {
   local name="$1"
-  local pose_file="/media/ubuntu/PS2000/poses/${name}.txt"
+  local pose_file="/media/amax/AE0E2AFD0E2ABE69/datasets/mapscape/poses/${name}.txt"
   if [[ ! -f "$pose_file" ]]; then
     echo "❌ 找不到 pose 文件: $pose_file"
     return 1
@@ -274,8 +274,8 @@ for target_name in "${target_names[@]}"; do
     echo "trans : $trans"
 
     echo "--- FPVLoc localization"
-    python /home/ubuntu/Documents/code/github/FPV/FPV-Test-512-cuda/main.py \
-      --config "/home/ubuntu/Documents/code/github/FPV/FPV-Test-512-cuda/configs/google.yaml" \
+    python /home/amax/Documents/code/lxy/PiLoT_v55/main_google_0401.py \
+      --config "/home/amax/Documents/code/lxy/PiLoT_v55/configs/google.yaml" \
       --init_euler "$euler" \
       --init_trans "$trans" \
       --name "$target_name"

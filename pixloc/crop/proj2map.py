@@ -9,6 +9,7 @@ from osgeo import gdal
 import os
 from PIL import Image
 import cv2
+from scipy.ndimage import distance_transform_edt
 
 def read_DSM_config(ref_dsm, npy_save_path):
     # 读取DSM
@@ -61,14 +62,15 @@ def geo_coords_to_dsm_index(x, y, transform):
 
 
 
-def ray_cast_to_dsm(DSM_path, K, pose, ref_npy_path, geotransform, uv, dsm_transform, ray_area, ray_area_minZ, num_sample=4000):
+def ray_cast_to_dsm(DSM_path, K, pose, ref_npy_path, geotransform, uv, dsm_transform,
+                    ray_area, ray_area_minZ, num_sample=4000, locator=None):
     """
     使用 DSM 做射线投射，返回射线与 DSM 的最近交点 (world xyz) 以及 DSM 像素索引。
     """
     from .ray_casting import TargetLocation
-    # from ray_casting import TargetLocation
     try:
-        locator = TargetLocation({"ray_casting": {}}, use_dsm=False)
+        if locator is None:
+            locator = TargetLocation({"ray_casting": {}}, use_dsm=False)
         hit_point = locator.predict_center_alt(DSM_path, pose, ref_npy_path, geotransform, K, ray_area, ray_area_minZ, num_sample=num_sample, object_pixel_coords=[uv[0], uv[1]])
         hit_rc = geo_coords_to_dsm_index(hit_point[0], hit_point[1], dsm_transform)
         return hit_point, hit_rc
@@ -134,82 +136,264 @@ def crop_dsm_dom(dom_data, dsm_data, dsm_transform,
 import numpy as np
 import cv2
 
-def crop_dsm_dom_point(DSM_path, pose, ref_npy_path, geotransform, dom_data, dsm_data, dsm_transform,
-                 K, pose_w2c, image_points, area_minZ, ray_area, ray_area_minZ,
-                 crop_padding=10):
-    world_points = []
-    dsm_indices = []
-    for uv in image_points:
-        xyz, rc = ray_cast_to_dsm(DSM_path, K, pose, ref_npy_path, geotransform, uv, dsm_transform, ray_area, ray_area_minZ)
-        # if xyz is None:
-        #     # 回退：与最小高度平面相交
-        #     xyz = pixel_to_world(K, pose_w2c, uv, target_z=area_minZ)
-        rc = geo_coords_to_dsm_index(xyz[0], xyz[1], dsm_transform)
-        world_points.append(xyz)
-        dsm_indices.append(rc)
+def _valid_dsm_values(values):
+    values = np.asarray(values)
+    return np.isfinite(values) & (values > 0) & (values < 10000)
 
-    rows, cols = zip(*dsm_indices)
+
+def _world_points_to_map_xy(world_points, dsm_transform):
+    xy = np.asarray(world_points, dtype=np.float64)[:, :2]
+    origin_x = float(dsm_transform.c)
+    origin_y = float(dsm_transform.f)
+    if -180 <= origin_x <= 180 and -90 <= origin_y <= 90 and np.nanmax(np.abs(xy)) > 1000:
+        import pyproj
+        transformer = pyproj.Transformer.from_crs("EPSG:4547", "EPSG:4326", always_xy=True)
+        x, y = transformer.transform(xy[:, 0], xy[:, 1])
+        return np.stack([x, y], axis=1)
+    return xy
+
+
+def _map_xy_to_dsm_float(map_xy, dsm_transform):
+    inv = ~dsm_transform
+    x = map_xy[:, 0]
+    y = map_xy[:, 1]
+    cols = inv.a * x + inv.b * y + inv.c
+    rows = inv.d * x + inv.e * y + inv.f
+    return rows, cols
+
+
+def _world_points_to_dsm_indices(world_points, dsm_transform):
+    map_xy = _world_points_to_map_xy(world_points, dsm_transform)
+    rows, cols = _map_xy_to_dsm_float(map_xy, dsm_transform)
+    return [(int(row), int(col)) for row, col in zip(rows, cols)]
+
+
+def _in_bounds(rows, cols, height, width):
+    return (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+
+
+def _validate_corner_crop(world_points, dsm_indices, dsm_data):
+    world_points = np.asarray(world_points, dtype=np.float64)
+    if world_points.shape[0] != 4 or not np.isfinite(world_points).all():
+        raise ValueError("crop corner raycast produced invalid world points")
+
+    rows = np.array([rc[0] for rc in dsm_indices], dtype=np.int64)
+    cols = np.array([rc[1] for rc in dsm_indices], dtype=np.int64)
     dsm_height, dsm_width = dsm_data.shape
+    if not _in_bounds(rows, cols, dsm_height, dsm_width).all():
+        raise ValueError("crop corners are outside DSM bounds")
+    if not _valid_dsm_values(dsm_data[rows, cols]).all():
+        raise ValueError("crop corners hit invalid DSM values")
 
-    row_min = max(min(rows) - crop_padding, 0)
-    row_max = min(max(rows) + crop_padding, dsm_height)
-    col_min = max(min(cols) - crop_padding, 0)
-    col_max = min(max(cols) + crop_padding, dsm_width)
 
-    # 先做一个矩形裁剪，避免对整幅图做透视
-    dsm_crop = dsm_data[row_min:row_max, col_min:col_max]
-    dom_crop = dom_data[:, row_min:row_max, col_min:col_max]
+def _fill_invalid_grid(values, valid):
+    if valid.all():
+        return values
+    if not np.any(valid):
+        raise ValueError("fallback crop has no valid DSM overlap")
+    nearest = distance_transform_edt(~valid, return_distances=False, return_indices=True)
+    return values[nearest[0], nearest[1]]
 
-    # DSM 像素 -> 实际地理坐标
-    xs = np.arange(col_min, col_max) * dsm_transform.a + dsm_transform.c
-    ys = np.arange(row_min, row_max) * dsm_transform.e + dsm_transform.f
-    xx, yy = np.meshgrid(xs, ys)
 
-    # 将角点转换到局部坐标系（以裁剪左上为原点）
-    dsm_poly_local = []
-    for r, c in dsm_indices:
-        dsm_poly_local.append([c - col_min, r - row_min])  # (x, y) = (col, row)
-    dsm_poly_local = np.array(dsm_poly_local, dtype=np.float32)
+def _grid_fallback_crop(DSM_path, pose, ref_npy_path, geotransform, dom_data, dsm_data,
+                        dsm_transform, K, image_width, image_height, ray_area,
+                        ray_area_minZ, locator, normal_error):
+    t0 = time.perf_counter()
+    out_w = max(int(round(float(image_width))), 1)
+    out_h = max(int(round(float(image_height))), 1)
+    grid_w = min(48, out_w)
+    grid_h = min(27, out_h)
 
-    # 目标输出大小：保持四角点仍是四角点（按多边形边长确定）
-    width_top = np.linalg.norm(dsm_poly_local[1] - dsm_poly_local[0])
-    width_bottom = np.linalg.norm(dsm_poly_local[2] - dsm_poly_local[3])
-    height_left = np.linalg.norm(dsm_poly_local[3] - dsm_poly_local[0])
-    height_right = np.linalg.norm(dsm_poly_local[2] - dsm_poly_local[1])
-    out_w = max(int(round(max(width_top, width_bottom))), 1)
-    out_h = max(int(round(max(height_left, height_right))), 1)
+    xs = np.linspace(0, image_width - 1, grid_w, dtype=np.float64)
+    ys = np.linspace(0, image_height - 1, grid_h, dtype=np.float64)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    grid_points = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=1)
 
-    dst_corners = np.array([
-        [0, 0],
-        [out_w - 1, 0],
-        [out_w - 1, out_h - 1],
-        [0, out_h - 1]
-    ], dtype=np.float32)
+    world_points = locator.predict_points_alt(
+        DSM_path, pose, ref_npy_path, geotransform, K,
+        ray_area, ray_area_minZ, num_sample=1500,
+        object_pixel_coords_list=grid_points
+    )
+    t_raycast = time.perf_counter()
+    world_points = np.asarray(world_points, dtype=np.float64)
+    map_xy = _world_points_to_map_xy(world_points, dsm_transform)
+    rows_f, cols_f = _map_xy_to_dsm_float(map_xy, dsm_transform)
 
-    # 透视变换矩阵：将 DSM/DOM 的局部四边形映射到规则矩形
-    H = cv2.getPerspectiveTransform(dsm_poly_local, dst_corners)
+    dsm_height, dsm_width = dsm_data.shape
+    rows_i = np.rint(rows_f).astype(np.int64)
+    cols_i = np.rint(cols_f).astype(np.int64)
+    in_bounds = _in_bounds(rows_i, cols_i, dsm_height, dsm_width)
+    dsm_valid = np.zeros(rows_i.shape, dtype=bool)
+    dsm_valid[in_bounds] = _valid_dsm_values(dsm_data[rows_i[in_bounds], cols_i[in_bounds]])
+    finite = np.isfinite(world_points).all(axis=1) & np.isfinite(rows_f) & np.isfinite(cols_f)
+    valid = finite & in_bounds & dsm_valid & (world_points[:, 2] > 0)
+    valid_grid = valid.reshape(grid_h, grid_w)
+    if not np.any(valid_grid):
+        raise ValueError(f"fallback crop failed after normal crop failed: {normal_error}")
 
-    # DOM: [C, H, W] -> [H, W, C] warp 后再转回
-    dom_hwc = np.transpose(dom_crop, (1, 2, 0))
-    dom_warp = cv2.warpPerspective(dom_hwc, H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+    cols_grid = _fill_invalid_grid(cols_f.reshape(grid_h, grid_w).astype(np.float32), valid_grid)
+    rows_grid = _fill_invalid_grid(rows_f.reshape(grid_h, grid_w).astype(np.float32), valid_grid)
+    x_grid = _fill_invalid_grid(world_points[:, 0].reshape(grid_h, grid_w).astype(np.float32), valid_grid)
+    y_grid = _fill_invalid_grid(world_points[:, 1].reshape(grid_h, grid_w).astype(np.float32), valid_grid)
+    z_grid = _fill_invalid_grid(world_points[:, 2].reshape(grid_h, grid_w).astype(np.float32), valid_grid)
+
+    map_x = cv2.resize(cols_grid, (out_w, out_h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    map_y = cv2.resize(rows_grid, (out_w, out_h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    valid_dense = cv2.resize(valid_grid.astype(np.uint8), (out_w, out_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    src_rows = map_y[valid_dense]
+    src_cols = map_x[valid_dense]
+    row_min = max(int(np.floor(src_rows.min())) - 2, 0)
+    row_max = min(int(np.ceil(src_rows.max())) + 3, dsm_height)
+    col_min = max(int(np.floor(src_cols.min())) - 2, 0)
+    col_max = min(int(np.ceil(src_cols.max())) + 3, dsm_width)
+    if row_max <= row_min or col_max <= col_min:
+        raise ValueError("fallback crop source bbox is empty")
+
+    dom_hwc = np.ascontiguousarray(np.transpose(dom_data[:, row_min:row_max, col_min:col_max], (1, 2, 0)))
+    dom_warp = cv2.remap(
+        dom_hwc, map_x - col_min, map_y - row_min,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    dom_warp[~valid_dense] = 0
     dom_warp = np.transpose(dom_warp, (2, 0, 1))
 
-    # DSM 高程
-    # 使用双线性插值获得更平滑的 DSM 高程
-    dsm_warp = cv2.warpPerspective(dsm_crop.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+    x_dense = cv2.resize(x_grid, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    y_dense = cv2.resize(y_grid, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    z_dense = cv2.resize(z_grid, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    xyz = np.stack([x_dense, y_dense, z_dense], axis=-1).astype(np.float32)
+    xyz[~valid_dense] = 0.0
+    t_warp = time.perf_counter()
 
-    # 将 X/Y 坐标一起透视，得到每个像素真实的地理坐标
-    x_warp = cv2.warpPerspective(xx.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
-    y_warp = cv2.warpPerspective(yy.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
-
-    # 组成 xyz 点云
-    xyz = np.stack([x_warp, y_warp, dsm_warp], axis=-1)
-    xyz = np.nan_to_num(xyz, nan=0.0)
-
+    valid_count = int(np.count_nonzero(valid_dense))
+    timings = {
+        "raycast_s": t_raycast - t0,
+        "warp_s": t_warp - t_raycast,
+        "total_s": t_warp - t0,
+        "crop_mode": "grid_fallback",
+        "fallback_grid": [int(grid_w), int(grid_h)],
+        "fallback_valid_pixels": valid_count,
+        "fallback_valid_ratio": float(valid_count / max(out_w * out_h, 1)),
+    }
+    dsm_indices = _world_points_to_dsm_indices(world_points[:4], dsm_transform)
     dsm_indices = [(col, row) for row, col in dsm_indices]
-    return dom_warp, xyz, np.array(dsm_indices), world_points, min(out_w, out_h)
+    return dom_warp, xyz, np.array(dsm_indices), world_points[:4].tolist(), min(out_w, out_h), timings
 
-def generate_ref_map(DSM_path, pose, ref_npy_path, geotransform, query_intrinsics, query_poses, name, area_minZ, dsm_data, dsm_transform, dom_data, ref_rgb_path, ref_depth_path, ray_area, ray_area_minZ, crop_padding=2, debug=True):
+
+def crop_dsm_dom_point(DSM_path, pose, ref_npy_path, geotransform, dom_data, dsm_data, dsm_transform,
+                 K, pose_w2c, image_points, area_minZ, ray_area, ray_area_minZ,
+                 crop_padding=10, locator=None):
+    t0 = time.perf_counter()
+    if locator is None:
+        try:
+            from .ray_casting import TargetLocation
+        except ImportError:
+            from ray_casting import TargetLocation
+        locator = TargetLocation({"ray_casting": {}}, use_dsm=False)
+
+    try:
+        world_points = locator.predict_points_alt(
+            DSM_path, pose, ref_npy_path, geotransform, K,
+            ray_area, ray_area_minZ, num_sample=4000,
+            object_pixel_coords_list=image_points
+        )
+        t_raycast = time.perf_counter()
+        dsm_indices = _world_points_to_dsm_indices(world_points, dsm_transform)
+        _validate_corner_crop(world_points, dsm_indices, dsm_data)
+
+        rows, cols = zip(*dsm_indices)
+        dsm_height, dsm_width = dsm_data.shape
+
+        row_min = max(min(rows) - crop_padding, 0)
+        row_max = min(max(rows) + crop_padding, dsm_height)
+        col_min = max(min(cols) - crop_padding, 0)
+        col_max = min(max(cols) + crop_padding, dsm_width)
+        if row_max <= row_min or col_max <= col_min:
+            raise ValueError("crop bbox is empty")
+
+        # 先做一个矩形裁剪，避免对整幅图做透视
+        dsm_crop = dsm_data[row_min:row_max, col_min:col_max]
+        dom_crop = dom_data[:, row_min:row_max, col_min:col_max]
+        if dsm_crop.size == 0 or dom_crop.size == 0:
+            raise ValueError("crop source image is empty")
+
+        # DSM 像素 -> 实际地理坐标
+        xs = np.arange(col_min, col_max) * dsm_transform.a + dsm_transform.c
+        ys = np.arange(row_min, row_max) * dsm_transform.e + dsm_transform.f
+        xx, yy = np.meshgrid(xs, ys)
+
+        # 将角点转换到局部坐标系（以裁剪左上为原点）
+        dsm_poly_local = []
+        for r, c in dsm_indices:
+            dsm_poly_local.append([c - col_min, r - row_min])  # (x, y) = (col, row)
+        dsm_poly_local = np.array(dsm_poly_local, dtype=np.float32)
+
+        # 目标输出大小：保持四角点仍是四角点（按多边形边长确定）
+        width_top = np.linalg.norm(dsm_poly_local[1] - dsm_poly_local[0])
+        width_bottom = np.linalg.norm(dsm_poly_local[2] - dsm_poly_local[3])
+        height_left = np.linalg.norm(dsm_poly_local[3] - dsm_poly_local[0])
+        height_right = np.linalg.norm(dsm_poly_local[2] - dsm_poly_local[1])
+        out_w = max(int(round(max(width_top, width_bottom))), 1)
+        out_h = max(int(round(max(height_left, height_right))), 1)
+        if out_w < 2 or out_h < 2:
+            raise ValueError("crop output is too small")
+
+        dst_corners = np.array([
+            [0, 0],
+            [out_w - 1, 0],
+            [out_w - 1, out_h - 1],
+            [0, out_h - 1]
+        ], dtype=np.float32)
+
+        # 透视变换矩阵：将 DSM/DOM 的局部四边形映射到规则矩形
+        H = cv2.getPerspectiveTransform(dsm_poly_local, dst_corners)
+        if not np.isfinite(H).all():
+            raise ValueError("crop homography is invalid")
+
+        # DOM: [C, H, W] -> [H, W, C] warp 后再转回
+        dom_hwc = np.transpose(dom_crop, (1, 2, 0))
+        dom_warp = cv2.warpPerspective(dom_hwc, H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+        dom_warp = np.transpose(dom_warp, (2, 0, 1))
+
+        # DSM 高程
+        # 使用双线性插值获得更平滑的 DSM 高程
+        dsm_warp = cv2.warpPerspective(dsm_crop.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+
+        # 将 X/Y 坐标一起透视，得到每个像素真实的地理坐标
+        x_warp = cv2.warpPerspective(xx.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+        y_warp = cv2.warpPerspective(yy.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+
+        # 组成 xyz 点云，无效 DSM 区域不给后端采样
+        xyz = np.stack([x_warp, y_warp, dsm_warp], axis=-1)
+        xyz = np.nan_to_num(xyz, nan=0.0)
+        valid = _valid_dsm_values(xyz[..., 2])
+        xyz[~valid] = 0.0
+        dom_warp[:, ~valid] = 0
+        t_warp = time.perf_counter()
+
+        dsm_indices = [(col, row) for row, col in dsm_indices]
+        timings = {
+            "raycast_s": t_raycast - t0,
+            "warp_s": t_warp - t_raycast,
+            "total_s": t_warp - t0,
+            "crop_mode": "perspective",
+        }
+        return dom_warp, xyz, np.array(dsm_indices), np.asarray(world_points).tolist(), min(out_w, out_h), timings
+    except Exception as exc:
+        image_width = K[0, 2] * 2
+        image_height = K[1, 2] * 2
+        return _grid_fallback_crop(
+            DSM_path, pose, ref_npy_path, geotransform, dom_data, dsm_data,
+            dsm_transform, K, image_width, image_height, ray_area, ray_area_minZ,
+            locator, exc,
+        )
+
+def generate_ref_map(DSM_path, pose, ref_npy_path, geotransform, query_intrinsics, query_poses, name,
+                     area_minZ, dsm_data, dsm_transform, dom_data, ref_rgb_path, ref_depth_path,
+                     ray_area, ray_area_minZ, crop_padding=2, debug=True, save_to_disk=True,
+                     locator=None):
 
 
     K_w2c = query_intrinsics
@@ -222,10 +406,11 @@ def generate_ref_map(DSM_path, pose, ref_npy_path, geotransform, query_intrinsic
     # print('--------------',name,'--------------')
     # image_points = [(width // 2, height // 2)]
 
-    dom_crop, point_cloud_crop, dsm_indices, world_coords, min_shape = crop_dsm_dom_point(
+    dom_crop, point_cloud_crop, dsm_indices, world_coords, min_shape, timings = crop_dsm_dom_point(
         DSM_path, pose, ref_npy_path, geotransform,
         dom_data, dsm_data, dsm_transform,
-        K_w2c, pose_w2c, image_points, area_minZ, ray_area, ray_area_minZ, crop_padding
+        K_w2c, pose_w2c, image_points, area_minZ, ray_area, ray_area_minZ, crop_padding,
+        locator=locator
     )
     # print(' world_coords', world_coords)
     if debug:
@@ -270,13 +455,17 @@ def generate_ref_map(DSM_path, pose, ref_npy_path, geotransform, query_intrinsic
     # [C, H, W] -> [H, W, C]
     if cropped_dom_img_uint8.shape[0] == 3:
         cropped_dom_img_uint8 = np.transpose(cropped_dom_img_uint8, (1, 2, 0))
-    Image.fromarray(cropped_dom_img_uint8).save(output_img_path)
+    if save_to_disk:
+        Image.fromarray(cropped_dom_img_uint8).save(output_img_path)
+        np.save(output_npy_path, point_cloud_crop)
 
-    np.save(output_npy_path, point_cloud_crop)
     data = {
             'imgr_name':name+'_dom',
             'exr_name':name+'_dsm',
-            'min_shape': min_shape
+            'min_shape': min_shape,
+            'dom_crop': cropped_dom_img_uint8,
+            'point_cloud_crop': point_cloud_crop,
+            'timings': timings,
         }
     return data
 

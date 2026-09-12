@@ -46,17 +46,17 @@ if __name__ == "__main__":
     targets = [
         # "interval1_HKisland01",
         # "interval1_HKisland_GNSS01",
-        # "interval1_HKairport_GNSS03"
-        "switzerland_seq4@8@foggy@intensity1@100",
-        "switzerland_seq4@8@foggy@intensity1@200",
-        "switzerland_seq4@8@foggy@intensity1@300",
-        "switzerland_seq4@8@foggy@intensity1@400",
-        "switzerland_seq4@8@foggy@intensity1@500"
+        # "interval1_AMvalley01_1"
+        "switzerland_seq7@8@night@intensity2@200",
+        # "switzerland_seq4@8@foggy@intensity1@200",
+        # "switzerland_seq4@8@foggy@intensity1@300",
+        # "switzerland_seq4@8@foggy@intensity1@400",
+        "switzerland_seq7@8@night@intensity2@500"
      ]
     # 在这里修改你的文件名
     for target in targets:
-        input_path = f'/media/amax/PS2000/depth_pose/{target}.txt'        # 输入文件路径
-        output_path = f'/media/amax/AE0E2AFD0E2ABE69/datasets/ue/angle/{target}.txt'    # 输出文件路径
+        input_path = f'/mnt/data1/UserData/liuxy/Mapscape/Test/poses/{target}.txt'        # 输入文件路径
+        output_path = f'/mnt/data1/UserData/liuxy/Mapscape/Test/angle/{target}.txt'    # 输出文件路径
     
         # 为了演示，我先创建一个包含你提供数据的临时文件
         # 实际使用时，你可以删除下面这几行写入测试数据的代码
