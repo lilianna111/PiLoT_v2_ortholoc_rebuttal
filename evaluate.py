@@ -105,4 +105,4 @@ import os
 # evaluate("/media/amax/AE0E2AFD0E2ABE69/datasets/uavscene/outputs/interval1_AMvalley01_1.txt", "/media/amax/AE0E2AFD0E2ABE69/datasets/uavscene/poses/interval1_AMvalley01_1.txt")
 # evaluate("/media/amax/AE0E2AFD0E2ABE69/datasets/outputs_render/uavscene/interval1_AMvalley01_1.txt", "/media/amax/AE0E2AFD0E2ABE69/datasets/uavscene/poses/interval1_AMvalley01_1.txt")
 
-evaluate("/media/amax/AE0E2AFD0E2ABE69/datasets/mapscape/outputs_both/USA_seq2@8@cloudy@200.txt", "/media/amax/AE0E2AFD0E2ABE69/datasets/mapscape/poses/USA_seq2@8@sunny@200.txt")
+evaluate("/media/amax/AE0E2AFD0E2ABE69/outputs_ortholoc/GIM_dkm_out/DJI_20250612193930_0012_V.txt", "/media/amax/AE0E2AFD0E2ABE69/outputs_ortholoc/GIM_dkm/DJI_20250612193930_0012_V.txt")
