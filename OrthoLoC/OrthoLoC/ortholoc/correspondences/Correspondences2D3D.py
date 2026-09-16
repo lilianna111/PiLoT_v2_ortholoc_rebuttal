@@ -57,6 +57,8 @@ class Correspondences2D3D(Correspondences):
         """
         Estimate the camera pose and intrinsics using 2D-3D correspondences.
         """
+        if (gravity_camera_up is None) != (gravity_world_up is None):
+            raise ValueError('Both camera and world Up vectors are required for gravity PnP')
         if gravity_camera_up is not None and intrinsics_matrix is None:
             raise ValueError('Gravity PnP requires known camera intrinsics')
         is_finite_mask = self.is_finite_mask

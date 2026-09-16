@@ -38,9 +38,10 @@ class GravityEstimator : public AbsolutePoseEstimator {
   public:
     GravityEstimator(const RansacOptions &opt, const std::vector<Point2D> &x,
                      const std::vector<Point3D> &X, const Point3D &camera_up,
-                     const Point3D &world_up, double threshold_deg)
+                     const Point3D &world_up, double threshold_deg, bool enforce_refinement_gravity)
         : AbsolutePoseEstimator(opt, x, X), camera_up(camera_up.normalized()),
-          world_up(world_up.normalized()), threshold_deg(threshold_deg) {}
+          world_up(world_up.normalized()), threshold_deg(threshold_deg),
+          enforce_refinement_gravity(enforce_refinement_gravity) {}
 
     double error_deg(const CameraPose &pose) const {
         const double dot = camera_up.dot(pose.R() * world_up);
@@ -51,17 +52,28 @@ class GravityEstimator : public AbsolutePoseEstimator {
         return pose.q.allFinite() && pose.t.allFinite() && error_deg(pose) <= threshold_deg;
     }
 
+    bool acceptable(const CameraPose &pose) const {
+        return pose.q.allFinite() && pose.t.allFinite() &&
+               (!enforce_refinement_gravity || valid(pose));
+    }
+
     void generate_models(std::vector<CameraPose> *models) {
         AbsolutePoseEstimator::generate_models(models);
         generated += models->size();
         const auto end = std::remove_if(models->begin(), models->end(),
-                                       [this](const CameraPose &p) { return !valid(p); });
+                                       [this](const CameraPose &p) {
+                                           if (!p.q.allFinite() || !p.t.allFinite()) {
+                                               ++nonfinite;
+                                               return true;
+                                           }
+                                           return !valid(p);
+                                       });
         rejected += std::distance(end, models->end());
         models->erase(end, models->end());
     }
 
     double score_model(const CameraPose &pose, size_t *inlier_count) const {
-        if (generated == rejected || !valid(pose)) {
+        if (generated == rejected || !acceptable(pose)) {
             *inlier_count = 0;
             return std::numeric_limits<double>::max();
         }
@@ -70,27 +82,29 @@ class GravityEstimator : public AbsolutePoseEstimator {
 
     void refine_model(CameraPose *pose) const {
         // Do not refine the identity placeholder when all hypotheses were rejected.
-        if (generated == rejected || !valid(*pose))
+        if (generated == rejected || !acceptable(*pose))
             return;
         const CameraPose before = *pose;
         AbsolutePoseEstimator::refine_model(pose);
-        if (!valid(*pose)) {
+        if (!acceptable(*pose)) {
             *pose = before;
             ++rejected_refinements;
         }
     }
 
-    size_t generated = 0, rejected = 0;
+    size_t generated = 0, rejected = 0, nonfinite = 0;
     mutable size_t rejected_refinements = 0;
 
   private:
     Point3D camera_up, world_up;
     double threshold_deg;
+    bool enforce_refinement_gravity;
 };
 
 py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point3D> &points3D,
                    const py::dict &camera_dict, const py::dict &ransac_dict,
-                   const Point3D &camera_up, const Point3D &world_up, double threshold_deg) {
+                   const Point3D &camera_up, const Point3D &world_up, double threshold_deg,
+                   bool enforce_refinement_gravity) {
     if (points2D.size() != points3D.size())
         throw py::value_error("2D and 3D correspondence counts differ");
     if (!camera_up.allFinite() || !world_up.allFinite() || camera_up.norm() < 1e-12 || world_up.norm() < 1e-12)
@@ -114,7 +128,8 @@ py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point
     std::vector<Point2D> calibrated(points2D.size());
     for (size_t k = 0; k < points2D.size(); ++k)
         camera.unproject(points2D[k], &calibrated[k]);
-    GravityEstimator estimator(scaled_opt, calibrated, points3D, camera_up, world_up, threshold_deg);
+    GravityEstimator estimator(scaled_opt, calibrated, points3D, camera_up, world_up, threshold_deg,
+                               enforce_refinement_gravity);
     CameraPose pose;
     pose.q << 1.0, 0.0, 0.0, 0.0;
     pose.t.setZero();
@@ -124,7 +139,7 @@ py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point
     {
         py::gil_scoped_release release;
         stats = ransac(estimator, scaled_opt, &pose);
-        if (estimator.generated > estimator.rejected && stats.num_inliers > 3 && estimator.valid(pose)) {
+        if (estimator.generated > estimator.rejected && stats.num_inliers > 3 && estimator.acceptable(pose)) {
             const double sq_threshold = scaled_opt.max_reproj_error * scaled_opt.max_reproj_error;
             get_inliers(pose, calibrated, points3D, sq_threshold, &inliers);
             const double scale = 1.0 / camera.focal();
@@ -141,7 +156,7 @@ py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point
             }
             CameraPose refined = pose;
             bundle_adjust(inlier2D, inlier3D, norm_camera, &refined, bundle_opt);
-            if (estimator.valid(refined)) {
+            if (estimator.acceptable(refined)) {
                 pose = refined;
                 final_refinement_accepted = true;
             }
@@ -151,7 +166,7 @@ py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point
     }
     const size_t num_inliers = std::count(inliers.begin(), inliers.end(), true);
     const bool success = estimator.generated > estimator.rejected && stats.num_inliers > 3 &&
-                         num_inliers > 3 && estimator.valid(pose);
+                         num_inliers > 3 && estimator.acceptable(pose);
     py::dict meta;
     write_to_dict(stats, meta);
     meta["success"] = success;
@@ -160,8 +175,10 @@ py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point
     meta["inliers"] = convert_inlier_vector(inliers);
     meta["generated_hypotheses"] = estimator.generated;
     meta["rejected_hypotheses"] = estimator.rejected;
+    meta["nonfinite_hypotheses"] = estimator.nonfinite;
     meta["rejected_refinements"] = estimator.rejected_refinements;
     meta["final_refinement_accepted"] = final_refinement_accepted;
+    meta["enforce_refinement_gravity"] = enforce_refinement_gravity;
     meta["gravity_error_deg"] = success ? py::cast(estimator.error_deg(pose)) : py::none();
     return py::make_tuple(success ? py::cast(pose.Rt()) : py::none(), meta);
 }
@@ -172,5 +189,5 @@ PYBIND11_MODULE(_gravity_pnp, m) {
     m.attr("poselib_version") = "2.0.5";
     m.def("estimate_absolute_pose", &estimate, py::arg("points2D"), py::arg("points3D"),
           py::arg("camera"), py::arg("ransac_options"), py::arg("camera_up"),
-          py::arg("world_up"), py::arg("threshold_deg"));
+          py::arg("world_up"), py::arg("threshold_deg"), py::arg("enforce_refinement_gravity") = true);
 }

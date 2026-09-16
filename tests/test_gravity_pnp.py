@@ -5,6 +5,7 @@ import ast
 import argparse
 import os
 import subprocess
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,21 @@ def synthetic_scene(seed=13, outliers=0, noise=0.0, count=100):
 
 
 class GravityCoordinatesTest(unittest.TestCase):
+    def test_nadir_and_horizontal_camera_up(self):
+        np.testing.assert_allclose(camera_up_from_roll_pitch(0, 0), [0, 0, -1], atol=1e-14)
+        np.testing.assert_allclose(camera_up_from_roll_pitch(0, 90), [0, -1, 0], atol=1e-14)
+
+    def test_actual_project_pose_conversion(self):
+        spec = importlib.util.spec_from_file_location('crop_pose_audit', REPO / 'crop/crop/transform_colmap.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for roll, pitch in [(0, 0), (0, 37.1), (10, 45), (-23, 70)]:
+            for yaw in [-175, 0, 42.4, 130]:
+                pose, _, _ = module.transform_colmap_pose_intrinsic(
+                    [113, 28, 200, roll, pitch, yaw], np.eye(3))
+                np.testing.assert_allclose(pose[:3, :3] @ ecef_up(113, 28),
+                                           camera_up_from_roll_pitch(roll, pitch), atol=1e-14)
+
     def test_camera_convention_and_yaw_invariance(self):
         for roll, pitch in [(0, 49), (10, -35), (-23, 90), (70, 179)]:
             prior = camera_up_from_roll_pitch(roll, pitch)
@@ -95,6 +111,68 @@ class NativeGravityPnPTest(unittest.TestCase):
                 self.assertEqual(info['rejected_hypotheses'], 0)
                 np.testing.assert_allclose(rt, pose.Rt, atol=1e-9, rtol=1e-9)
 
+    def test_unrestricted_gate_across_seeds_and_outlier_ratios(self):
+        import poselib
+        for seed in [0, 1, 19]:
+            for outliers in [0, 20, 60]:
+                with self.subTest(seed=seed, outliers=outliers):
+                    x, X, cam, R, _ = synthetic_scene(outliers=outliers, noise=0.2)
+                    options = dict(self.options, seed=seed)
+                    original, _ = poselib.estimate_absolute_pose(x, X, cam, options, {})
+                    up = ecef_up(113, 28)
+                    rt, info = self.backend.estimate_absolute_pose(x, X, cam, options, R @ up, up, 180)
+                    self.assertTrue(info['success'])
+                    np.testing.assert_allclose(rt, original.Rt, atol=1e-9, rtol=1e-9)
+
+    def test_unrestricted_gate_with_duplicate_correspondences(self):
+        import poselib
+        x, X, cam, R, _ = synthetic_scene(count=10)
+        x, X = np.repeat(x, 10, axis=0), np.repeat(X, 10, axis=0)
+        original, _ = poselib.estimate_absolute_pose(x, X, cam, self.options, {})
+        up = ecef_up(113, 28)
+        rt, info = self.solve(x, X, cam, R @ up, up, 180)
+        self.assertTrue(info['success'])
+        self.assertGreater(info['nonfinite_hypotheses'], 0)
+        self.assertEqual(info['rejected_hypotheses'], info['nonfinite_hypotheses'])
+        np.testing.assert_allclose(rt, original.Rt, atol=1e-9, rtol=1e-9)
+
+    def test_world_rotation_and_origin_translation_invariance(self):
+        x, X, cam, R, t = synthetic_scene()
+        up = ecef_up(113, 28)
+        Q = Rotation.from_euler('xyz', [-37, 81, 17], degrees=True).as_matrix()
+        offset = np.array([1000, -500, 300])
+        changed_X = X @ Q.T + offset
+        expected_R = R @ Q.T
+        expected_t = t - expected_R @ offset
+        rt, info = self.solve(x, changed_X, cam, R @ up, Q @ up, 2)
+        self.assertTrue(info['success'])
+        np.testing.assert_allclose(rt[:, :3], expected_R, atol=1e-7)
+        np.testing.assert_allclose(rt[:, 3], expected_t, atol=1e-4)
+
+    def test_returned_inliers_match_the_returned_pose(self):
+        x, X, cam, R, _ = synthetic_scene(outliers=20, noise=1.0)
+        up = ecef_up(113, 28)
+        rt, info = self.solve(x, X, cam, R @ up, up, 2)
+        self.assertTrue(info['success'])
+        camera_points = X @ rt[:, :3].T + rt[:, 3]
+        residual = camera_points[:, :2] / camera_points[:, 2:] - (x - [320, 240]) / [900, 880]
+        expected = (np.sum(residual ** 2, axis=1) < (self.options['max_reproj_error'] / 890) ** 2)
+        expected &= camera_points[:, 2] > 0
+        np.testing.assert_array_equal(info['inliers'], expected)
+        self.assertEqual(info['num_inliers'], int(expected.sum()))
+
+    def test_degenerate_and_nonfinite_correspondences(self):
+        x, X, cam, R, _ = synthetic_scene()
+        up = ecef_up(113, 28)
+        rt, info = self.solve(x, np.zeros_like(X), cam, R @ up, up, 2)
+        self.assertIsNone(rt)
+        self.assertFalse(info['success'])
+        X[0, 0] = np.nan
+        with self.assertRaises(ValueError):
+            self.solve(x, X, cam, R @ up, up, 2)
+        with self.assertRaises(ValueError):
+            self.solve(x[:-1], X, cam, R @ up, up, 2)
+
     def test_ecef_pose_with_noise_and_outliers(self):
         x, X, cam, R, t = synthetic_scene(outliers=20, noise=0.2)
         world_up = ecef_up(113, 28)
@@ -141,6 +219,37 @@ class NativeGravityPnPTest(unittest.TestCase):
         self.assertLessEqual(info['gravity_error_deg'], 0.2)
         self.assertGreater(info['rejected_refinements'], 0)
         self.assertFalse(info['final_refinement_accepted'])
+        candidate_rt, candidate_info = self.backend.estimate_absolute_pose(
+            x, X, cam, options, prior, up, 0.2, enforce_refinement_gravity=False)
+        self.assertTrue(candidate_info['success'])
+        self.assertIsNotNone(candidate_rt)
+        self.assertGreater(candidate_info['gravity_error_deg'], 0.2)
+        self.assertEqual(candidate_info['rejected_refinements'], 0)
+        self.assertTrue(candidate_info['final_refinement_accepted'])
+
+    def test_candidate_only_mode_still_fails_if_every_candidate_is_rejected(self):
+        x, X, cam, R, _ = synthetic_scene()
+        up = ecef_up(113, 28)
+        rt, info = self.backend.estimate_absolute_pose(
+            x, X, cam, self.options, -R @ up, up, 1e-8, enforce_refinement_gravity=False)
+        self.assertIsNone(rt)
+        self.assertFalse(info['success'])
+
+    def test_gate_accepts_a_pose_inside_and_rejects_one_outside_its_angle(self):
+        x, X, cam, R, _ = synthetic_scene()
+        up = ecef_up(113, 28)
+        camera_up = R @ up
+        axis = np.cross(camera_up, [1, 0, 0])
+        axis /= np.linalg.norm(axis)
+        prior = Rotation.from_rotvec(axis * np.deg2rad(1)).apply(camera_up)
+        options = dict(self.options, max_reproj_error=1e-4)
+        for threshold, expected_success in [(1.01, True), (0.99, False)]:
+            with self.subTest(threshold=threshold):
+                rt, info = self.backend.estimate_absolute_pose(x, X, cam, options, prior, up, threshold)
+                self.assertEqual(info['success'], expected_success)
+                if expected_success:
+                    self.assertAlmostEqual(info['gravity_error_deg'], 1, places=5)
+                    np.testing.assert_allclose(rt[:, :3], R, atol=1e-7)
 
     def test_small_input_and_invalid_prior(self):
         x, X, cam, R, _ = synthetic_scene()
@@ -152,6 +261,17 @@ class NativeGravityPnPTest(unittest.TestCase):
                 self.solve(x, X, cam, vector, [0, 0, 1], 2)
         with self.assertRaises(ValueError):
             self.solve(x, X, cam, R[:, 2], [0, 0, 1], 0)
+
+    def test_frozen_input_replay_controls(self):
+        spec = importlib.util.spec_from_file_location('gravity_replay_audit', REPO / 'scripts/verify_gravity_pnp.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        x, X, cam, R, _ = synthetic_scene(outliers=20, noise=0.2)
+        up = ecef_up(113, 28)
+        records = module.replay(x, X, cam, self.options, R @ up, up, 2)
+        self.assertLess(records['gravity_180']['max_pose_difference_from_original'], 1e-8)
+        self.assertTrue(records['gravity_strict']['success'])
+        self.assertIsNone(records['reversed_prior_tight_gate']['pose_w2c'])
 
 
 class PnPIntegrationTest(unittest.TestCase):
@@ -203,6 +323,16 @@ class PnPIntegrationTest(unittest.TestCase):
                        dict(mode='cv2', gravity_camera_up=[0, 0, 1], gravity_world_up=[0, 0, 1])]:
             with self.assertRaises(ValueError):
                 self.pose.run_pnp(x, X, np.eye(3), **kwargs)
+
+    def test_calibration_cannot_silently_drop_an_incomplete_prior(self):
+        from ortholoc.correspondences import Correspondences2D3D
+        x, X, _, _, _ = synthetic_scene()
+        correspondences = Correspondences2D3D(pts0=x, pts1=X, is_normalized=False, confidences=np.ones(len(x)))
+        with patch.object(self.pose, 'run_calibration', return_value=(False, None, None)) as calibration:
+            with self.assertRaisesRegex(ValueError, 'Both camera and world'):
+                correspondences.calibrate(num_points=None, width=640, height=480,
+                                          intrinsics_matrix=None, gravity_world_up=np.array([0, 0, 1]))
+            calibration.assert_not_called()
 
     def test_correspondence_filtering_sampling_and_prior_forwarding(self):
         from ortholoc.correspondences import Correspondences2D3D
@@ -266,6 +396,17 @@ class PnPIntegrationTest(unittest.TestCase):
 
 
 class LauncherConfigTest(unittest.TestCase):
+    def test_validation_refuses_to_overwrite_an_existing_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sentinel = Path(directory) / 'existing_result.txt'
+            sentinel.write_text('keep this result')
+            result = subprocess.run(
+                [sys.executable, '-B', str(REPO / 'scripts/verify_gravity_pnp.py'),
+                 '--inputs', directory, '--output', directory], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('FileExistsError', result.stderr)
+            self.assertEqual(sentinel.read_text(), 'keep this result')
+
     def launch_without_localization(self, extra_args=(), overrides=None):
         # Run both launchers with a fake Python command and isolated pose fixture.
         # Never import main.py or enter its output-directory cleanup.
