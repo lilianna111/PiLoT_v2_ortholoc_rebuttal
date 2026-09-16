@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x *)",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, '/home/amax/Documents/code/lxy/PiLoT_ortholoc/OrthoLoC/OrthoLoC'\\); from imcui.ui.utils import get_matcher_zoo, load_config; import os; config = load_config\\(os.path.join\\('/home/amax/Documents/code/lxy/PiLoT_ortholoc/OrthoLoC/OrthoLoC/ortholoc/image_matching', 'matchers_imcui.yaml'\\)\\); zoo = get_matcher_zoo\\(config['matcher_zoo']\\); import pprint; pprint.pprint\\(zoo.get\\('GIM\\(dkm\\)', {}\\)\\)\")",
+      "Bash(python3 *)",
+      "Bash(pip3 show *)"
+    ]
+  }
+}
