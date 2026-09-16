@@ -258,6 +258,10 @@ def run_ortholoc_localization_on_crop(
     reprojection_error=5.0,
     pnp_mode="poselib",
     num_points=None,
+    gravity_camera_up=None,
+    gravity_world_up=None,
+    gravity_threshold_deg=2.0,
+    pnp_seed=None,
 ):
     ortholoc_utils, _, _ = load_ortholoc_components()
 
@@ -295,6 +299,7 @@ def run_ortholoc_localization_on_crop(
         raise RuntimeError("No valid correspondences after confidence/covisibility filtering.")
 
     correspondences_2d3d = correspondences_2d2d.to_2d3d(grid3d_1=dsm_grid)
+    pnp_stats = {}
     success, pose_c2w_pred, intrinsics_matrix_pred, inliers_mask, reprojection_errors = correspondences_2d3d.calibrate(
         num_points=num_points,
         intrinsics_matrix=intrinsics_matrix,
@@ -302,9 +307,14 @@ def run_ortholoc_localization_on_crop(
         height=height,
         reprojection_error=reprojection_error,
         pnp_mode=pnp_mode,
+        gravity_camera_up=gravity_camera_up,
+        gravity_world_up=gravity_world_up,
+        gravity_threshold_deg=gravity_threshold_deg,
+        ransac_seed=pnp_seed,
+        pnp_stats=pnp_stats,
     )
     if not success or pose_c2w_pred is None:
-        raise RuntimeError("OrthoLoC PnP/calibration failed.")
+        raise RuntimeError(f"OrthoLoC PnP/calibration failed: {pnp_stats}")
 
     pose_c2w_4x4 = np.eye(4, dtype=np.float64)
     pose_c2w_4x4[:3, :] = np.asarray(pose_c2w_pred, dtype=np.float64)
@@ -321,6 +331,7 @@ def run_ortholoc_localization_on_crop(
         "num_matches_filtered": int(len(correspondences_2d2d)),
         "num_inliers": num_inliers,
         "median_reprojection_error": median_reproj,
+        "pnp_stats": pnp_stats,
     }
 # def process_map_crop(ref_DSM_path, pose_data, ref_npy_path, name, map_data_pack, paths_pack, ray_area, ray_area_minZ):        # 包含输出路径
 #     """
@@ -416,6 +427,29 @@ def postprocess_crop_to_render_grid(color, points3d, valid_mask, target_w, targe
 
 class DualProcessTask:        
     def __init__(self, config, init_euler = None, init_trans = None, name = None, args=None):
+        self.ortholoc_pnp_prior = getattr(args, "ortholoc_pnp_prior", "none")
+        self.ortholoc_gravity_prior_file = getattr(args, "ortholoc_gravity_prior_file", None)
+        self.ortholoc_gravity_prior_format = getattr(args, "ortholoc_gravity_prior_format", "roll_pitch")
+        self.ortholoc_gravity_threshold_deg = getattr(args, "ortholoc_gravity_threshold_deg", 2.0)
+        self.ortholoc_pnp_seed = getattr(args, "ortholoc_pnp_seed", None)
+        self.gravity_priors = {}
+        # Validate the new opt-in backend/input BEFORE existing output-directory cleanup.
+        if self.ortholoc_pnp_prior == "gravity":
+            if getattr(args, "ortholoc_pnp_mode", "poselib") != "poselib":
+                raise ValueError("Gravity PnP requires --ortholoc_pnp_mode poselib")
+            if not self.ortholoc_gravity_prior_file:
+                raise ValueError("Gravity PnP requires an explicit --ortholoc_gravity_prior_file; no GT fallback")
+            if not np.isfinite(self.ortholoc_gravity_threshold_deg) or not 0 < self.ortholoc_gravity_threshold_deg <= 180:
+                raise ValueError("Gravity threshold must be in (0, 180] degrees")
+            ensure_ortholoc_import_path()
+            from ortholoc.gravity import load_gravity_priors, require_gravity_backend
+
+            require_gravity_backend()
+            self.ortholoc_gravity_prior_file = os.path.abspath(os.path.expanduser(self.ortholoc_gravity_prior_file))
+            self.gravity_priors = load_gravity_priors(
+                self.ortholoc_gravity_prior_file, self.ortholoc_gravity_prior_format)
+        if self.ortholoc_pnp_seed is not None and self.ortholoc_pnp_seed < 0:
+            raise ValueError("PnP seed must be nonnegative")
         # 用 multiprocessing 队列/事件
         self.task_q   = Queue(maxsize=2)     # 渲染 → 定位
         self.pose_q   = Queue(maxsize=3)     # 定位 → 渲染
@@ -433,6 +467,13 @@ class DualProcessTask:
         if name is not None:
             dataset_name = name
             output_name = name
+        if self.ortholoc_pnp_prior == "gravity":
+            query_dir = os.path.join(folder_path, 'images', dataset_name)
+            query_names = {os.path.basename(p) for ext in ("png", "jpg", "JPG")
+                           for p in glob.glob(os.path.join(query_dir, f"*.{ext}"))}
+            missing = query_names - self.gravity_priors.keys()
+            if missing:
+                raise ValueError(f"Gravity priors missing for {len(missing)} images, e.g. {sorted(missing)[:5]}")
         # if init_euler is not None:
         #     self.render_config['init_rot'], self.render_config['init_trans'] = init_euler, init_trans
         #     self.euler_angles = init_euler
@@ -448,8 +489,10 @@ class DualProcessTask:
             ch if ch.isalnum() or ch in ("-", "_") else "_"
             for ch in self.ortholoc_matcher
         ).strip("_") or "matcher"
+        if self.ortholoc_pnp_prior == "gravity":
+            matcher_dir += "_gravity"
         output_folder = os.path.join(
-            "/media/amax/PS2000/ortholoc",
+            os.path.expanduser(getattr(args, "ortholoc_output_root", "/media/amax/PS2000/ortholoc")),
             matcher_dir,
         )
         # output_folder = "/media/amax/AE0E2AFD0E2ABE69/datasets/outputs/FPVLoc_depth_weixing"
@@ -806,6 +849,9 @@ class DualProcessTask:
             "ecef_origin",
             "pose_c2w_flat",
             "pose_w2c_flat",
+            "pnp_prior_mode",
+            "gravity_error_deg",
+            "gravity_rejected_hypotheses",
         ]
         with open(self.ortholoc_pose_debug_txt, "w", encoding="utf-8") as f_debug:
             f_debug.write("\t".join(debug_header) + "\n")
@@ -849,6 +895,9 @@ class DualProcessTask:
                 format_matrix_flat(ortho_ret.get("ecef_origin") if ortho_ret else None),
                 format_matrix_flat(ortho_ret.get("pose_c2w") if ortho_ret else None),
                 format_matrix_flat(ortho_ret.get("pose_w2c") if ortho_ret else None),
+                self.ortholoc_pnp_prior,
+                format_float(ortho_ret.get("pnp_stats", {}).get("gravity_error_deg") if ortho_ret else None),
+                format_float(ortho_ret.get("pnp_stats", {}).get("rejected_hypotheses") if ortho_ret else None),
             ]
             line = "\t".join(row)
             with open(self.ortholoc_pose_debug_txt, "a", encoding="utf-8") as f_debug:
@@ -959,6 +1008,15 @@ class DualProcessTask:
             jump_m = None
             jump_deg = None
             try:
+                camera_up = None
+                world_up = None
+                if self.ortholoc_pnp_prior == "gravity":
+                    from ortholoc.gravity import ecef_up
+
+                    camera_up = self.gravity_priors[qname]
+                    # Local vertical comes from the map origin, NOT ECEF Z or frame GT.
+                    map_lon, map_lat, _ = crop_ecef_to_wgs84(*ecef_origin)
+                    world_up = ecef_up(map_lon, map_lat)
                 ortho_ret = run_ortholoc_localization_on_crop(
                     img_path=img_path,
                     image_dop=dom_warp,
@@ -970,6 +1028,10 @@ class DualProcessTask:
                     reprojection_error=self.ortholoc_reprojection_error,
                     pnp_mode=self.ortholoc_pnp_mode,
                     num_points=self.ortholoc_num_points,
+                    gravity_camera_up=camera_up,
+                    gravity_world_up=world_up,
+                    gravity_threshold_deg=self.ortholoc_gravity_threshold_deg,
+                    pnp_seed=self.ortholoc_pnp_seed,
                 )
 
                 ortho_ret["pose_c2w"] = add_ecef_origin_to_pose(ortho_ret["pose_c2w"], ecef_origin)
@@ -1067,6 +1129,9 @@ class DualProcessTask:
                         "num_matches_filtered": ortho_ret["num_matches_filtered"],
                         "num_inliers": ortho_ret["num_inliers"],
                         "median_reprojection_error": ortho_ret["median_reprojection_error"],
+                        "pnp_stats": ortho_ret["pnp_stats"],
+                        "gravity_camera_up": camera_up.tolist() if camera_up is not None else None,
+                        "gravity_world_up": world_up.tolist() if world_up is not None else None,
                         "translation_wgs84": pred_translation.tolist(),
                         "euler_pitch_roll_yaw": pred_euler.tolist(),
                         "gt_error_m": jump_m,
@@ -1146,6 +1211,11 @@ class DualProcessTask:
                     "matcher": self.ortholoc_matcher,
                     "device": self.ortholoc_device,
                     "angles": self.ortholoc_angles,
+                    "pnp_prior_mode": self.ortholoc_pnp_prior,
+                    "gravity_prior_file": self.ortholoc_gravity_prior_file,
+                    "gravity_prior_format": self.ortholoc_gravity_prior_format,
+                    "gravity_threshold_deg": self.ortholoc_gravity_threshold_deg,
+                    "pnp_seed": self.ortholoc_pnp_seed,
                     "poses": aggregated_poses,
                     "failed_images": failed_images,
                     "gt_reset_enabled": self.gt_reset_translation_thresh_m > 0 or self.gt_reset_rotation_thresh_deg > 0,
@@ -1363,6 +1433,19 @@ def parse_args():
         default=None,
         help="OrthoLoC PnP 最多使用多少 2D-3D 对应点，默认不截断"
     )
+
+    parser.add_argument("--ortholoc_pnp_prior", choices=["none", "gravity"], default="none",
+                        help="none 保持原 PnP；gravity 使用重力方向筛选 P3P 候选")
+    parser.add_argument("--ortholoc_gravity_prior_file", default=None,
+                        help="独立先验文件，按完整图像 basename 对齐，不自动使用 GT")
+    parser.add_argument("--ortholoc_gravity_prior_format", choices=["roll_pitch", "camera_up"],
+                        default="roll_pitch", help="image roll_deg pitch_deg 或 image ux uy uz；必须是相机系先验")
+    parser.add_argument("--ortholoc_gravity_threshold_deg", type=float, default=2.0,
+                        help="候选及优化后位姿与重力先验的最大夹角（度）")
+    parser.add_argument("--ortholoc_pnp_seed", type=int, default=None,
+                        help="可选固定 PnP 点抽样和 PoseLib seed，不影响视觉匹配")
+    parser.add_argument("--ortholoc_output_root", default="/media/amax/PS2000/ortholoc",
+                        help="定位结果根目录，其下按 matcher 和 prior 模式区分")
 
     parser.add_argument(
         "--min_ortholoc_crop_size",

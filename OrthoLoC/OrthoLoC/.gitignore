@@ -18,4 +18,5 @@ log.txt
 internal/
 .aux.xml
 __pycache__/
+ortholoc/_gravity_pnp*.so
 *outputs/

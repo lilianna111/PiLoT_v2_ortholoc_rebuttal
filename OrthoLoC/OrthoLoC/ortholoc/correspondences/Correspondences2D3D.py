@@ -50,11 +50,15 @@ class Correspondences2D3D(Correspondences):
     def calibrate(
         self, num_points: int, width: int, height: int, intrinsics_matrix: np.ndarray | None = None,
         reprojection_error_diag_ratio=None, focal_length_init: np.ndarray | None = None, reprojection_error=5.0,
-        pnp_mode='poselib', fix_principle_points: bool = True
+        pnp_mode='poselib', fix_principle_points: bool = True,
+        gravity_camera_up: np.ndarray | None = None, gravity_world_up: np.ndarray | None = None,
+        gravity_threshold_deg: float = 2.0, ransac_seed: int | None = None, pnp_stats: dict | None = None
     ) -> tuple[bool, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         """
         Estimate the camera pose and intrinsics using 2D-3D correspondences.
         """
+        if gravity_camera_up is not None and intrinsics_matrix is None:
+            raise ValueError('Gravity PnP requires known camera intrinsics')
         is_finite_mask = self.is_finite_mask
         correspondences_2d3d_denormalized = self.denormalized(w0=width, h0=height)
         correspondences_2d3d_finite = correspondences_2d3d_denormalized.take_mask(is_finite_mask)
@@ -68,7 +72,8 @@ class Correspondences2D3D(Correspondences):
 
         if len(pts2d_query) > 0:
             if num_points is not None and len(pts2d_query) > num_points:
-                idxs = np.array(random.sample(range(len(pts2d_query)), num_points))
+                rng = random if ransac_seed is None else random.Random(ransac_seed)
+                idxs = np.array(rng.sample(range(len(pts2d_query)), num_points))
             else:
                 idxs = np.arange(len(pts2d_query))
             pts3d_query = pts3d_query[idxs]
@@ -90,7 +95,12 @@ class Correspondences2D3D(Correspondences):
                                                                           K=intrinsics_matrix, distortion=None,
                                                                           mode=pnp_mode,
                                                                           reprojectionError=reprojection_error_img,
-                                                                          img_size=(width, height))
+                                                                          img_size=(width, height),
+                                                                          gravity_camera_up=gravity_camera_up,
+                                                                          gravity_world_up=gravity_world_up,
+                                                                          gravity_threshold_deg=gravity_threshold_deg,
+                                                                          ransac_seed=ransac_seed,
+                                                                          pnp_stats=pnp_stats)
             if pose_c2w_pred is not None:
                 pose_c2w_pred = pose_c2w_pred[:3, :].astype(np.float32)
             if intrinsics_matrix is not None:

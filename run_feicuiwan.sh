@@ -23,6 +23,21 @@ DSM_PATH="${DSM_PATH:-/media/amax/AE0E2AFD0E2ABE69/datasets/DSM/0.3/0.3/DSM0.3_D
 ORTHOLOC_MATCHER="${ORTHOLOC_MATCHER:-Mast3R}"
 ORTHOLOC_DEVICE="${ORTHOLOC_DEVICE:-cuda}"
 ORTHOLOC_ANGLES=(${ORTHOLOC_ANGLES:-0})
+ORTHOLOC_PNP_PRIOR="${ORTHOLOC_PNP_PRIOR:-none}"
+ORTHOLOC_GRAVITY_PRIOR_FORMAT="${ORTHOLOC_GRAVITY_PRIOR_FORMAT:-roll_pitch}"
+ORTHOLOC_GRAVITY_THRESHOLD_DEG="${ORTHOLOC_GRAVITY_THRESHOLD_DEG:-2}"
+ORTHOLOC_OUTPUT_ROOT="${ORTHOLOC_OUTPUT_ROOT:-/media/amax/PS2000/ortholoc}"
+PNP_PRIOR_ARGS=(
+  --ortholoc_pnp_prior "$ORTHOLOC_PNP_PRIOR"
+  --ortholoc_gravity_prior_format "$ORTHOLOC_GRAVITY_PRIOR_FORMAT"
+  --ortholoc_gravity_threshold_deg "$ORTHOLOC_GRAVITY_THRESHOLD_DEG"
+)
+if [[ -n "${ORTHOLOC_GRAVITY_PRIOR_FILE:-}" ]]; then
+  PNP_PRIOR_ARGS+=(--ortholoc_gravity_prior_file "$ORTHOLOC_GRAVITY_PRIOR_FILE")
+fi
+if [[ -n "${ORTHOLOC_PNP_SEED:-}" ]]; then
+  PNP_PRIOR_ARGS+=(--ortholoc_pnp_seed "$ORTHOLOC_PNP_SEED")
+fi
 MAX_GT_RECROPS="${MAX_GT_RECROPS:-1}"
 GT_RESET_TRANSLATION_THRESH_M="${GT_RESET_TRANSLATION_THRESH_M:-50}"
 GT_RESET_ROTATION_THRESH_DEG="${GT_RESET_ROTATION_THRESH_DEG:-50}"
@@ -206,6 +221,11 @@ for target_name in "${target_names[@]}"; do
     echo "euler : $euler"
     echo "trans : $trans"
 
+    SEQUENCE_PNP_ARGS=("${PNP_PRIOR_ARGS[@]}")
+    if [[ -z "${ORTHOLOC_GRAVITY_PRIOR_FILE:-}" && -n "${ORTHOLOC_GRAVITY_PRIOR_DIR:-}" ]]; then
+      SEQUENCE_PNP_ARGS+=(--ortholoc_gravity_prior_file "${ORTHOLOC_GRAVITY_PRIOR_DIR}/${target_name}.txt")
+    fi
+
     echo "--- crop + ortholoc"
     python "$MAIN_PY" \
       --config "$CONFIG_PATH" \
@@ -217,12 +237,15 @@ for target_name in "${target_names[@]}"; do
       --crop_k_json "$CROP_K_JSON" \
       --ortholoc_intrinsics "$ORTHOLOC_INTRINSICS" \
       --ortholoc_matcher "$ORTHOLOC_MATCHER" \
+      --ortholoc_output_root "$ORTHOLOC_OUTPUT_ROOT" \
       --ortholoc_device "$ORTHOLOC_DEVICE" \
       --ortholoc_angles "${ORTHOLOC_ANGLES[@]}" \
       --max_gt_recrops "$MAX_GT_RECROPS" \
       --gt_reset_translation_thresh_m "$GT_RESET_TRANSLATION_THRESH_M" \
       --gt_reset_rotation_thresh_deg "$GT_RESET_ROTATION_THRESH_DEG" \
-      --continue_on_error
+      --continue_on_error \
+      "${SEQUENCE_PNP_ARGS[@]}" \
+      "$@"
 
     echo -e "==== 运行 $target_name 结束 ====\n"
 

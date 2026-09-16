@@ -119,7 +119,10 @@ def opencv_to_colmap_intrinsics(K: np.ndarray) -> np.ndarray:
 
 def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.ndarray | None = None,
             mode: str = 'cv2', reprojectionError: float = 5.0, img_size: tuple[int, int] | None = None,
-            no_ransac: bool = False) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
+            no_ransac: bool = False, gravity_camera_up: np.ndarray | None = None,
+            gravity_world_up: np.ndarray | None = None, gravity_threshold_deg: float = 2.0,
+            ransac_seed: int | None = None, pnp_stats: dict | None = None
+            ) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
     """
     Perform Perspective-n-Point (PnP) pose estimation.
     use OPENCV model for distortion (4 values)
@@ -134,6 +137,11 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
         reprojectionError: Maximum reprojection error for RANSAC.
         img_size: Image size (width, height) for certain modes.
         no_ransac: Whether to disable RANSAC.
+        gravity_camera_up: Signed Up in OpenCV camera coordinates; None keeps original PnP.
+        gravity_world_up: Signed local Up in the SAME world frame as pts3D (not ECEF Z).
+        gravity_threshold_deg: Hard angular validity threshold for P3P and refined poses.
+        ransac_seed: Optional seed for point subsampling and PoseLib RANSAC.
+        pnp_stats: Optional output dictionary of solver diagnostics (excluding the inlier mask).
 
     Returns:
         A tuple containing:
@@ -142,10 +150,25 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
         - Inlier mask (if applicable).
     """
 
+    use_gravity = gravity_camera_up is not None
+    if use_gravity != (gravity_world_up is not None):
+        raise ValueError('Both camera and world Up vectors are required for gravity PnP')
+    if use_gravity and (mode != 'poselib' or no_ransac):
+        raise ValueError('Gravity prior requires PoseLib with RANSAC enabled')
+    if ransac_seed is not None and ransac_seed < 0:
+        raise ValueError('RANSAC seed must be nonnegative')
+    if use_gravity:
+        from ortholoc.gravity import require_gravity_backend
+        gravity_backend = require_gravity_backend()
+
+    num_input_points = len(pts2D)
+    sample_idxs = None
     if len(pts2D) > 10_000:
         logger.warning(f"Too many points for PnP, using only the random 10_000")
         # sample 10_000 points
-        idxs = np.random.choice(len(pts2D), 10_000, replace=False)
+        rng = np.random if ransac_seed is None else np.random.default_rng(ransac_seed)
+        idxs = rng.choice(len(pts2D), 10_000, replace=False)
+        sample_idxs = idxs
         pts2D = pts2D[idxs]
         pts3D = pts3D[idxs]
 
@@ -196,15 +219,34 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
             pts2D = np.copy(pts2D)
             pts2D[:, 0] += 0.5
             pts2D[:, 1] += 0.5
-            pose, meta = poselib.estimate_absolute_pose(pts2D, pts3D, camera, {
+            ransac_options = {
                 'max_reproj_error': reprojectionError,
                 'max_iterations': iterationsCount,
                 'success_prob': confidence
-            }, {})
-            inlier_mask = np.array(meta['inliers'])
-            if pose is None:
+            }
+            if ransac_seed is not None:
+                ransac_options['seed'] = ransac_seed
+            if use_gravity:
+                RT, meta = gravity_backend.estimate_absolute_pose(
+                    pts2D, pts3D, camera, ransac_options,
+                    gravity_camera_up, gravity_world_up, gravity_threshold_deg)
+            else:
+                pose, meta = poselib.estimate_absolute_pose(pts2D, pts3D, camera, ransac_options, {})
+                RT = None if pose is None else pose.Rt
+            if pnp_stats is not None:
+                pnp_stats.update({key: value for key, value in meta.items() if key != 'inliers'})
+                pnp_stats.update(prior_mode='gravity' if use_gravity else 'none',
+                                 backend='gravity_pnp_2.0.5' if use_gravity else 'poselib',
+                                 num_input_points=num_input_points, num_used_points=len(pts2D),
+                                 seed=0 if ransac_seed is None else ransac_seed,
+                                 success=RT is not None)
+            if RT is None:
                 return False, None, None
-            RT = pose.Rt  # (3x4)
+            inlier_mask = np.array(meta['inliers'], dtype=bool)
+            if sample_idxs is not None:
+                full_mask = np.zeros(num_input_points, dtype=bool)
+                full_mask[sample_idxs] = inlier_mask
+                inlier_mask = full_mask
             RT = np.r_[RT, [(0, 0, 0, 1)]]  # world2cam
             return True, np.linalg.inv(RT), inlier_mask  # cam2toworld
         elif len(pts2D) > 4 and mode == "pycolmap":
@@ -267,6 +309,8 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
             return False, None, None
     except Exception as e:
         logger.warning(f'error during pnp: {e}')
+        if pnp_stats is not None:
+            pnp_stats.update(success=False, error=str(e))
         return False, None, None
 
 
