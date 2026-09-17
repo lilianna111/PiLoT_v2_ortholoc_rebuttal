@@ -105,4 +105,21 @@ import os
 # evaluate("/media/amax/AE0E2AFD0E2ABE69/datasets/uavscene/outputs/interval1_AMvalley01_1.txt", "/media/amax/AE0E2AFD0E2ABE69/datasets/uavscene/poses/interval1_AMvalley01_1.txt")
 # evaluate("/media/amax/AE0E2AFD0E2ABE69/datasets/outputs_render/uavscene/interval1_AMvalley01_1.txt", "/media/amax/AE0E2AFD0E2ABE69/datasets/uavscene/poses/interval1_AMvalley01_1.txt")
 
-evaluate("/media/amax/AE0E2AFD0E2ABE69/outputs_ortholoc/GIM_dkm_out/DJI_20250612193930_0012_V.txt", "/media/amax/AE0E2AFD0E2ABE69/outputs_ortholoc/GIM_dkm/DJI_20250612193930_0012_V.txt")
+sequence = "DJI_20250612193930_0012_V"
+gt_pose = f"/media/amax/AE0E2AFD0E2ABE69/datasets/poses/{sequence}.txt"
+results = {
+    "RoMa (visual PnP, no gravity prior)": (
+        f"/media/amax/PS2000/rebuttal/ortholoc/RoMa/{sequence}/poses.txt"
+    ),
+    "RoMa + gravity-gated PnP (2 deg)": (
+        f"/media/amax/PS2000/rebuttal/ortholoc/RoMa_gravity/{sequence}/poses.txt"
+    ),
+}
+
+for label, pose_file in results.items():
+    if not os.path.isfile(pose_file):
+        print(f"--------------{label}: result not found------------------")
+        print(pose_file)
+        continue
+    print(f"--------------{label}------------------")
+    evaluate(pose_file, gt_pose)
