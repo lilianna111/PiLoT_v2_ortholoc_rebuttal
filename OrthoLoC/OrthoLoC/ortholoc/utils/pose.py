@@ -121,7 +121,10 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
             mode: str = 'cv2', reprojectionError: float = 5.0, img_size: tuple[int, int] | None = None,
             no_ransac: bool = False, gravity_camera_up: np.ndarray | None = None,
             gravity_world_up: np.ndarray | None = None, gravity_threshold_deg: float = 2.0,
-            ransac_seed: int | None = None, pnp_stats: dict | None = None
+            ransac_seed: int | None = None, pnp_stats: dict | None = None,
+            depth_prior=None, depth_threshold_m: float = 10.0,
+            prior_fusion: str = 'hard', gravity_scale_deg: float = 10.0, depth_scale_m: float = 10.0,
+            gravity_weight: float = 0.1, depth_weight: float = 0.1
             ) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
     """
     Perform Perspective-n-Point (PnP) pose estimation.
@@ -142,6 +145,13 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
         gravity_threshold_deg: Hard angular validity threshold for P3P and refined poses.
         ransac_seed: Optional seed for point subsampling and PoseLib RANSAC.
         pnp_stats: Optional output dictionary of solver diagnostics (excluding the inlier mask).
+        depth_prior: Callable on local-ECEF world-to-camera Rt; returns signed DSM residual in metres.
+        depth_threshold_m: Hard absolute height-error threshold, including optimized poses.
+        prior_fusion: 'hard' gates hypotheses, 'soft' retains legacy score penalties,
+            'balanced' keeps visual RANSAC and adds guarded priors only to final BA.
+        gravity_scale_deg, depth_scale_m: Positive residual scales, NOT acceptance thresholds.
+        gravity_weight, depth_weight: Nonnegative weights; balanced mode uses each as a
+            gradient target parameter (default 0.1 means about 0.15 of visual gradient).
 
     Returns:
         A tuple containing:
@@ -153,13 +163,34 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
     use_gravity = gravity_camera_up is not None
     if use_gravity != (gravity_world_up is not None):
         raise ValueError('Both camera and world Up vectors are required for gravity PnP')
-    if use_gravity and (mode != 'poselib' or no_ransac):
-        raise ValueError('Gravity prior requires PoseLib with RANSAC enabled')
+    use_depth = depth_prior is not None
+    if prior_fusion not in ('hard', 'soft', 'balanced'):
+        raise ValueError('prior_fusion must be hard, soft or balanced')
+    if (not np.isfinite([gravity_scale_deg, depth_scale_m]).all() or
+            gravity_scale_deg <= 0 or depth_scale_m <= 0):
+        raise ValueError('Soft prior scales must be finite and positive')
+    if (not np.isfinite([gravity_weight, depth_weight]).all() or gravity_weight < 0 or depth_weight < 0):
+        raise ValueError('Soft prior weights must be finite and nonnegative')
+    if (use_gravity or use_depth or prior_fusion == 'balanced') and (mode != 'poselib' or no_ransac):
+        raise ValueError('Gravity/depth prior requires PoseLib with RANSAC enabled')
+    if use_depth and (not callable(depth_prior) or not np.isfinite(depth_threshold_m) or depth_threshold_m < 0):
+        raise ValueError('Depth prior must be callable, with a finite nonnegative threshold')
+    if use_depth and distortion is not None:
+        raise ValueError('Depth backprojection currently requires the existing undistorted PINHOLE camera')
     if ransac_seed is not None and ransac_seed < 0:
         raise ValueError('RANSAC seed must be nonnegative')
-    if use_gravity:
+    if use_gravity or use_depth or prior_fusion == 'balanced':
         from ortholoc.gravity import require_gravity_backend
         gravity_backend = require_gravity_backend()
+        if prior_fusion == 'soft' and not getattr(gravity_backend, 'supports_soft_priors', False):
+            raise RuntimeError('Rebuild the soft-scoring PnP backend: bash scripts/build_gravity_pnp.sh')
+        if prior_fusion == 'balanced' and not getattr(gravity_backend, 'supports_balanced_priors', False):
+            raise RuntimeError('Rebuild the balanced PnP backend: bash scripts/build_gravity_pnp.sh')
+        if use_depth and not getattr(gravity_backend, 'supports_depth', False):
+            raise RuntimeError('Rebuild the depth-enabled PnP backend: bash scripts/build_gravity_pnp.sh')
+        if use_depth and getattr(depth_prior, 'diagnostic_dir', None) is not None and not getattr(
+                gravity_backend, 'supports_depth_diagnostics', False):
+            raise RuntimeError('Rebuild the depth diagnostics backend: bash scripts/build_gravity_pnp.sh')
 
     num_input_points = len(pts2D)
     sample_idxs = None
@@ -226,17 +257,49 @@ def run_pnp(pts2D: np.ndarray, pts3D: np.ndarray, K: np.ndarray, distortion: np.
             }
             if ransac_seed is not None:
                 ransac_options['seed'] = ransac_seed
-            if use_gravity:
+            soft_options = dict(prior_fusion=prior_fusion, gravity_scale_deg=gravity_scale_deg,
+                                depth_scale_m=depth_scale_m, gravity_weight=gravity_weight,
+                                depth_weight=depth_weight) if prior_fusion in ('soft', 'balanced') else {}
+            if use_depth:
+                up_cam = gravity_camera_up if use_gravity else np.array([0., 0., 1.])
+                up_world = gravity_world_up if use_gravity else np.array([0., 0., 1.])
+                RT, meta = gravity_backend.estimate_absolute_pose(
+                    pts2D, pts3D, camera, ransac_options, up_cam, up_world, gravity_threshold_deg,
+                    depth_evaluator=depth_prior, depth_threshold_m=depth_threshold_m, use_gravity=use_gravity,
+                    **soft_options)
+                closest = meta.get('closest_depth_candidate')
+                if closest is not None:
+                    closest['pose_w2c_local_ecef'] = np.asarray(closest['pose_w2c_local_ecef']).tolist()
+                if RT is not None and hasattr(depth_prior, 'details') and (prior_fusion == 'hard' or depth_weight > 0):
+                    meta.update(depth_prior.details(RT))
+                elif RT is None and hasattr(depth_prior, 'save_failure'):
+                    try:
+                        meta.update(depth_prior.save_failure(
+                            pts2D, pts3D, camera, ransac_options, meta, up_cam, up_world,
+                            gravity_threshold_deg))
+                    except Exception as exc:
+                        # Diagnostic I/O must not replace the original solver failure.
+                        meta['failure_diagnostic_error'] = str(exc)
+                        logger.warning(f'Cannot save failed PnP inputs: {exc}')
+            elif use_gravity:
                 RT, meta = gravity_backend.estimate_absolute_pose(
                     pts2D, pts3D, camera, ransac_options,
-                    gravity_camera_up, gravity_world_up, gravity_threshold_deg)
+                    gravity_camera_up, gravity_world_up, gravity_threshold_deg, **soft_options)
+            elif prior_fusion == 'balanced':
+                RT, meta = gravity_backend.estimate_absolute_pose(
+                    pts2D, pts3D, camera, ransac_options,
+                    [0., 0., 1.], [0., 0., 1.], gravity_threshold_deg,
+                    use_gravity=False, **soft_options)
             else:
                 pose, meta = poselib.estimate_absolute_pose(pts2D, pts3D, camera, ransac_options, {})
                 RT = None if pose is None else pose.Rt
             if pnp_stats is not None:
                 pnp_stats.update({key: value for key, value in meta.items() if key != 'inliers'})
-                pnp_stats.update(prior_mode='gravity' if use_gravity else 'none',
-                                 backend='gravity_pnp_2.0.5' if use_gravity else 'poselib',
+                prior_mode = 'gravity_depth' if use_gravity and use_depth else (
+                    'depth' if use_depth else 'gravity' if use_gravity else 'none')
+                pnp_stats.update(prior_mode=prior_mode,
+                                 prior_fusion=prior_fusion if use_gravity or use_depth else 'none',
+                                 backend='gravity_pnp_2.0.5' if use_gravity or use_depth or prior_fusion == 'balanced' else 'poselib',
                                  num_input_points=num_input_points, num_used_points=len(pts2D),
                                  seed=0 if ransac_seed is None else ransac_seed,
                                  success=RT is not None)

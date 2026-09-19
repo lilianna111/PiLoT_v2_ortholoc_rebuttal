@@ -52,15 +52,18 @@ class Correspondences2D3D(Correspondences):
         reprojection_error_diag_ratio=None, focal_length_init: np.ndarray | None = None, reprojection_error=5.0,
         pnp_mode='poselib', fix_principle_points: bool = True,
         gravity_camera_up: np.ndarray | None = None, gravity_world_up: np.ndarray | None = None,
-        gravity_threshold_deg: float = 2.0, ransac_seed: int | None = None, pnp_stats: dict | None = None
+        gravity_threshold_deg: float = 2.0, ransac_seed: int | None = None, pnp_stats: dict | None = None,
+        depth_prior=None, depth_threshold_m: float = 10.0,
+        prior_fusion: str = 'hard', gravity_scale_deg: float = 10.0, depth_scale_m: float = 10.0,
+        gravity_weight: float = 0.1, depth_weight: float = 0.1
     ) -> tuple[bool, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         """
         Estimate the camera pose and intrinsics using 2D-3D correspondences.
         """
         if (gravity_camera_up is None) != (gravity_world_up is None):
             raise ValueError('Both camera and world Up vectors are required for gravity PnP')
-        if gravity_camera_up is not None and intrinsics_matrix is None:
-            raise ValueError('Gravity PnP requires known camera intrinsics')
+        if (gravity_camera_up is not None or depth_prior is not None) and intrinsics_matrix is None:
+            raise ValueError('Gravity/depth PnP requires known camera intrinsics')
         is_finite_mask = self.is_finite_mask
         correspondences_2d3d_denormalized = self.denormalized(w0=width, h0=height)
         correspondences_2d3d_finite = correspondences_2d3d_denormalized.take_mask(is_finite_mask)
@@ -102,9 +105,22 @@ class Correspondences2D3D(Correspondences):
                                                                           gravity_world_up=gravity_world_up,
                                                                           gravity_threshold_deg=gravity_threshold_deg,
                                                                           ransac_seed=ransac_seed,
-                                                                          pnp_stats=pnp_stats)
+                                                                          pnp_stats=pnp_stats,
+                                                                          depth_prior=depth_prior,
+                                                                          depth_threshold_m=depth_threshold_m,
+                                                                          prior_fusion=prior_fusion,
+                                                                          gravity_scale_deg=gravity_scale_deg,
+                                                                          depth_scale_m=depth_scale_m,
+                                                                          gravity_weight=gravity_weight,
+                                                                          depth_weight=depth_weight)
             if pose_c2w_pred is not None:
-                pose_c2w_pred = pose_c2w_pred[:3, :].astype(np.float32)
+                # Keep the scored/validated pose in double precision for prior runs.
+                keep_double = ((prior_fusion == 'hard' and depth_prior is not None) or
+                               prior_fusion == 'balanced' or
+                               (prior_fusion == 'soft' and
+                                ((gravity_camera_up is not None and gravity_weight > 0) or
+                                 (depth_prior is not None and depth_weight > 0))))
+                pose_c2w_pred = pose_c2w_pred[:3, :].astype(np.float64 if keep_double else np.float32)
             if intrinsics_matrix is not None:
                 intrinsics_matrix = intrinsics_matrix.astype(np.float32)
             if inliers_mask is not None and len(inliers_mask) == len(idxs):

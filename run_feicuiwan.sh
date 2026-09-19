@@ -24,19 +24,30 @@ ORTHOLOC_MATCHER="${ORTHOLOC_MATCHER:-Mast3R}"
 ORTHOLOC_DEVICE="${ORTHOLOC_DEVICE:-cuda}"
 ORTHOLOC_ANGLES=(${ORTHOLOC_ANGLES:-0})
 ORTHOLOC_PNP_PRIOR="${ORTHOLOC_PNP_PRIOR:-none}"
+ORTHOLOC_PRIOR_FUSION="${ORTHOLOC_PRIOR_FUSION:-hard}"
 ORTHOLOC_GRAVITY_PRIOR_FORMAT="${ORTHOLOC_GRAVITY_PRIOR_FORMAT:-roll_pitch}"
 ORTHOLOC_GRAVITY_THRESHOLD_DEG="${ORTHOLOC_GRAVITY_THRESHOLD_DEG:-2}"
+ORTHOLOC_DEPTH_THRESHOLD_M="${ORTHOLOC_DEPTH_THRESHOLD_M:-10}"
 ORTHOLOC_OUTPUT_ROOT="${ORTHOLOC_OUTPUT_ROOT:-/media/amax/PS2000/ortholoc}"
 PNP_PRIOR_ARGS=(
   --ortholoc_pnp_prior "$ORTHOLOC_PNP_PRIOR"
+  --ortholoc_prior_fusion "$ORTHOLOC_PRIOR_FUSION"
+  --ortholoc_gravity_scale_deg "${ORTHOLOC_GRAVITY_SCALE_DEG:-10}"
+  --ortholoc_depth_scale_m "${ORTHOLOC_DEPTH_SCALE_M:-10}"
+  --ortholoc_gravity_weight "${ORTHOLOC_GRAVITY_WEIGHT:-0.1}"
+  --ortholoc_depth_weight "${ORTHOLOC_DEPTH_WEIGHT:-0.1}"
   --ortholoc_gravity_prior_format "$ORTHOLOC_GRAVITY_PRIOR_FORMAT"
   --ortholoc_gravity_threshold_deg "$ORTHOLOC_GRAVITY_THRESHOLD_DEG"
+  --ortholoc_depth_threshold_m "$ORTHOLOC_DEPTH_THRESHOLD_M"
 )
 if [[ -n "${ORTHOLOC_GRAVITY_PRIOR_FILE:-}" ]]; then
   PNP_PRIOR_ARGS+=(--ortholoc_gravity_prior_file "$ORTHOLOC_GRAVITY_PRIOR_FILE")
 fi
 if [[ -n "${ORTHOLOC_PNP_SEED:-}" ]]; then
   PNP_PRIOR_ARGS+=(--ortholoc_pnp_seed "$ORTHOLOC_PNP_SEED")
+fi
+if [[ -n "${ORTHOLOC_DEPTH_PRIOR_FILE:-}" ]]; then
+  PNP_PRIOR_ARGS+=(--ortholoc_depth_prior_file "$ORTHOLOC_DEPTH_PRIOR_FILE")
 fi
 MAX_GT_RECROPS="${MAX_GT_RECROPS:-1}"
 GT_RESET_TRANSLATION_THRESH_M="${GT_RESET_TRANSLATION_THRESH_M:-50}"
@@ -164,7 +175,7 @@ target_names=(
   # "DJI_20251221132525_0004_V_1"
   # "DJI_20250612194622_0018_V"
   # "DJI_20250612174308_0001_V"
-  "DJI_20250612182017_0001_V"
+  # "DJI_20250612182017_0001_V"
   "DJI_20250612182732_0001_V"
   "DJI_20250612183852_0005_V"
   # "DJI_20250612193930_0012_V"
@@ -224,6 +235,9 @@ for target_name in "${target_names[@]}"; do
     SEQUENCE_PNP_ARGS=("${PNP_PRIOR_ARGS[@]}")
     if [[ -z "${ORTHOLOC_GRAVITY_PRIOR_FILE:-}" && -n "${ORTHOLOC_GRAVITY_PRIOR_DIR:-}" ]]; then
       SEQUENCE_PNP_ARGS+=(--ortholoc_gravity_prior_file "${ORTHOLOC_GRAVITY_PRIOR_DIR}/${target_name}.txt")
+    fi
+    if [[ -z "${ORTHOLOC_DEPTH_PRIOR_FILE:-}" && -n "${ORTHOLOC_DEPTH_PRIOR_DIR:-}" ]]; then
+      SEQUENCE_PNP_ARGS+=(--ortholoc_depth_prior_file "${ORTHOLOC_DEPTH_PRIOR_DIR}/${target_name}.txt")
     fi
 
     echo "--- crop + ortholoc"

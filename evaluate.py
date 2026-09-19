@@ -114,6 +114,21 @@ results = {
     "RoMa + gravity-gated PnP (2 deg)": (
         f"/media/amax/PS2000/rebuttal/ortholoc/RoMa_gravity/{sequence}/poses.txt"
     ),
+    "RoMa + depth-DSM-gated PnP (10 m)": (
+        f"/media/amax/PS2000/rebuttal/ortholoc/RoMa_depth/{sequence}/poses.txt"
+    ),
+    "RoMa + gravity/depth-gated PnP (2 deg, 10 m)": (
+        f"/media/amax/PS2000/rebuttal/ortholoc/RoMa_gravity_depth/{sequence}/poses.txt"
+    ),
+    "RoMa + gravity soft-scored PnP": (
+        f"/media/amax/PS2000/rebuttal/ortholoc/RoMa_gravity_soft/{sequence}/poses.txt"
+    ),
+    "RoMa + depth-DSM soft-scored PnP": (
+        f"/media/amax/PS2000/rebuttal/ortholoc/RoMa_depth_soft/{sequence}/poses.txt"
+    ),
+    "RoMa + gravity/depth soft-scored PnP": (
+        f"/media/amax/PS2000/rebuttal/ortholoc/RoMa_gravity_depth_soft/{sequence}/poses.txt"
+    ),
 }
 
 for label, pose_file in results.items():
@@ -123,3 +138,4 @@ for label, pose_file in results.items():
         continue
     print(f"--------------{label}------------------")
     evaluate(pose_file, gt_pose)
+

@@ -4,6 +4,7 @@ import sys
 import ast
 import argparse
 import os
+import re
 import subprocess
 import importlib.util
 import tempfile
@@ -417,6 +418,9 @@ class LauncherConfigTest(unittest.TestCase):
             for script in ('run_google_roma.sh', 'run_feicuiwan.sh'):
                 text = (REPO / script).read_text().replace(
                     '/media/amax/AE0E2AFD0E2ABE69/datasets/poses/', str(root) + '/')
+                # Keep this fixture independent of the user's active sequence selection.
+                if script == 'run_feicuiwan.sh':
+                    text = re.sub(r'target_names=\([\s\S]*?\)', f'target_names=("{name}")', text)
                 (root / script).write_text(text)
             env = {k: v for k, v in os.environ.items() if not k.startswith('ORTHOLOC_')}
             env.update(CONDA_PREFIX=sys.prefix, LD_LIBRARY_PATH=env.get('LD_LIBRARY_PATH', ''))

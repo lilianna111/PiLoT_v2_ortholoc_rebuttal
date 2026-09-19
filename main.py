@@ -262,6 +262,13 @@ def run_ortholoc_localization_on_crop(
     gravity_world_up=None,
     gravity_threshold_deg=2.0,
     pnp_seed=None,
+    depth_prior=None,
+    depth_threshold_m=10.0,
+    prior_fusion="hard",
+    gravity_scale_deg=10.0,
+    depth_scale_m=10.0,
+    gravity_weight=0.1,
+    depth_weight=0.1,
 ):
     ortholoc_utils, _, _ = load_ortholoc_components()
 
@@ -312,6 +319,13 @@ def run_ortholoc_localization_on_crop(
         gravity_threshold_deg=gravity_threshold_deg,
         ransac_seed=pnp_seed,
         pnp_stats=pnp_stats,
+        depth_prior=depth_prior,
+        depth_threshold_m=depth_threshold_m,
+        prior_fusion=prior_fusion,
+        gravity_scale_deg=gravity_scale_deg,
+        depth_scale_m=depth_scale_m,
+        gravity_weight=gravity_weight,
+        depth_weight=depth_weight,
     )
     if not success or pose_c2w_pred is None:
         raise RuntimeError(f"OrthoLoC PnP/calibration failed: {pnp_stats}")
@@ -428,23 +442,51 @@ def postprocess_crop_to_render_grid(color, points3d, valid_mask, target_w, targe
 class DualProcessTask:        
     def __init__(self, config, init_euler = None, init_trans = None, name = None, args=None):
         self.ortholoc_pnp_prior = getattr(args, "ortholoc_pnp_prior", "none")
+        self.ortholoc_prior_fusion = getattr(args, "ortholoc_prior_fusion", "hard")
+        self.ortholoc_gravity_scale_deg = getattr(args, "ortholoc_gravity_scale_deg", 10.0)
+        self.ortholoc_depth_scale_m = getattr(args, "ortholoc_depth_scale_m", 10.0)
+        self.ortholoc_gravity_weight = getattr(args, "ortholoc_gravity_weight", 0.1)
+        self.ortholoc_depth_weight = getattr(args, "ortholoc_depth_weight", 0.1)
+        if self.ortholoc_prior_fusion not in ("hard", "soft", "balanced"):
+            raise ValueError("Prior fusion must be hard, soft or balanced")
+        if (not np.isfinite([self.ortholoc_gravity_scale_deg, self.ortholoc_depth_scale_m]).all()
+                or self.ortholoc_gravity_scale_deg <= 0 or self.ortholoc_depth_scale_m <= 0):
+            raise ValueError("Soft prior scales must be finite and positive")
+        if (not np.isfinite([self.ortholoc_gravity_weight, self.ortholoc_depth_weight]).all()
+                or self.ortholoc_gravity_weight < 0 or self.ortholoc_depth_weight < 0):
+            raise ValueError("Soft prior weights must be finite and nonnegative")
         self.ortholoc_gravity_prior_file = getattr(args, "ortholoc_gravity_prior_file", None)
         self.ortholoc_gravity_prior_format = getattr(args, "ortholoc_gravity_prior_format", "roll_pitch")
         self.ortholoc_gravity_threshold_deg = getattr(args, "ortholoc_gravity_threshold_deg", 2.0)
         self.ortholoc_pnp_seed = getattr(args, "ortholoc_pnp_seed", None)
+        self.use_gravity = self.ortholoc_pnp_prior in ("gravity", "gravity_depth")
+        self.use_depth = self.ortholoc_pnp_prior in ("depth", "gravity_depth")
+        self.ortholoc_depth_prior_file = getattr(args, "ortholoc_depth_prior_file", None)
+        self.ortholoc_depth_threshold_m = getattr(args, "ortholoc_depth_threshold_m", 10.0)
         self.gravity_priors = {}
+        self.depth_priors = {}
         # Validate the new opt-in backend/input BEFORE existing output-directory cleanup.
-        if self.ortholoc_pnp_prior == "gravity":
+        if self.use_gravity or self.use_depth or self.ortholoc_prior_fusion == "balanced":
             if getattr(args, "ortholoc_pnp_mode", "poselib") != "poselib":
-                raise ValueError("Gravity PnP requires --ortholoc_pnp_mode poselib")
+                raise ValueError("Gravity/depth PnP requires --ortholoc_pnp_mode poselib")
+            ensure_ortholoc_import_path()
+            from ortholoc.gravity import require_gravity_backend
+
+            backend = require_gravity_backend()
+            if self.ortholoc_prior_fusion == "soft" and not getattr(backend, "supports_soft_priors", False):
+                raise RuntimeError("Rebuild the soft-scoring backend: bash scripts/build_gravity_pnp.sh")
+            if self.ortholoc_prior_fusion == "balanced" and not getattr(backend, "supports_balanced_priors", False):
+                raise RuntimeError("Rebuild the balanced-refinement backend: bash scripts/build_gravity_pnp.sh")
+            if self.use_depth and not getattr(backend, "supports_depth", False):
+                raise RuntimeError("Rebuild the depth-enabled PnP backend: bash scripts/build_gravity_pnp.sh")
+            if self.use_depth and not getattr(backend, "supports_depth_diagnostics", False):
+                raise RuntimeError("Rebuild the depth diagnostics backend: bash scripts/build_gravity_pnp.sh")
+        if self.use_gravity:
             if not self.ortholoc_gravity_prior_file:
                 raise ValueError("Gravity PnP requires an explicit --ortholoc_gravity_prior_file; no GT fallback")
             if not np.isfinite(self.ortholoc_gravity_threshold_deg) or not 0 < self.ortholoc_gravity_threshold_deg <= 180:
                 raise ValueError("Gravity threshold must be in (0, 180] degrees")
-            ensure_ortholoc_import_path()
-            from ortholoc.gravity import load_gravity_priors, require_gravity_backend
-
-            require_gravity_backend()
+            from ortholoc.gravity import load_gravity_priors
             self.ortholoc_gravity_prior_file = os.path.abspath(os.path.expanduser(self.ortholoc_gravity_prior_file))
             self.gravity_priors = load_gravity_priors(
                 self.ortholoc_gravity_prior_file, self.ortholoc_gravity_prior_format)
@@ -467,13 +509,29 @@ class DualProcessTask:
         if name is not None:
             dataset_name = name
             output_name = name
-        if self.ortholoc_pnp_prior == "gravity":
+        if self.use_gravity or self.use_depth:
             query_dir = os.path.join(folder_path, 'images', dataset_name)
             query_names = {os.path.basename(p) for ext in ("png", "jpg", "JPG")
                            for p in glob.glob(os.path.join(query_dir, f"*.{ext}"))}
+        if self.use_gravity:
             missing = query_names - self.gravity_priors.keys()
             if missing:
                 raise ValueError(f"Gravity priors missing for {len(missing)} images, e.g. {sorted(missing)[:5]}")
+        if self.use_depth:
+            from ortholoc.depth import load_depth_priors
+            import rasterio
+
+            if not self.ortholoc_depth_prior_file:
+                raise ValueError("Depth PnP requires --ortholoc_depth_prior_file; no GT fallback")
+            if not np.isfinite(self.ortholoc_depth_threshold_m) or self.ortholoc_depth_threshold_m < 0:
+                raise ValueError("Depth threshold must be finite and nonnegative")
+            self.ortholoc_depth_prior_file = os.path.abspath(os.path.expanduser(self.ortholoc_depth_prior_file))
+            self.depth_priors = load_depth_priors(self.ortholoc_depth_prior_file, query_names)
+            # Validate DSM headers before any existing output-directory cleanup.
+            with rasterio.open(os.path.expanduser(getattr(args, "dsm_path", ""))) as dataset:
+                gt = dataset.transform.to_gdal()
+                if dataset.crs is None or gt[2] != 0 or gt[4] != 0 or gt[1] == 0 or gt[5] == 0:
+                    raise ValueError("Depth PnP requires a georeferenced axis-aligned DSM")
         # if init_euler is not None:
         #     self.render_config['init_rot'], self.render_config['init_trans'] = init_euler, init_trans
         #     self.euler_angles = init_euler
@@ -489,8 +547,12 @@ class DualProcessTask:
             ch if ch.isalnum() or ch in ("-", "_") else "_"
             for ch in self.ortholoc_matcher
         ).strip("_") or "matcher"
-        if self.ortholoc_pnp_prior == "gravity":
-            matcher_dir += "_gravity"
+        if self.ortholoc_pnp_prior != "none":
+            matcher_dir += "_" + self.ortholoc_pnp_prior
+            if self.ortholoc_prior_fusion == "soft":
+                matcher_dir += "_soft"
+        if self.ortholoc_prior_fusion == "balanced":
+            matcher_dir += "_balanced"
         output_folder = os.path.join(
             os.path.expanduser(getattr(args, "ortholoc_output_root", "/media/amax/PS2000/ortholoc")),
             matcher_dir,
@@ -795,10 +857,21 @@ class DualProcessTask:
                 raise ValueError(f"Unsupported OrthoLoC matcher: {self.ortholoc_matcher}")
 
             stage = "load_camera_params"
+            logging.info("OrthoLoC PnP prior=%s fusion=%s soft_scales=%s deg/%s m soft_weights=%s/%s",
+                         self.ortholoc_pnp_prior, self.ortholoc_prior_fusion,
+                         self.ortholoc_gravity_scale_deg, self.ortholoc_depth_scale_m,
+                         self.ortholoc_gravity_weight, self.ortholoc_depth_weight)
             logging.info("Localization init: loading intrinsics from %s", self.ortholoc_intrinsics)
             _, intrinsics_matrix = ortholoc_utils.io.load_camera_params(self.ortholoc_intrinsics)
             if intrinsics_matrix is None:
                 raise ValueError(f"Failed to load intrinsics from {self.ortholoc_intrinsics}")
+
+            depth_dsm = None
+            if self.use_depth:
+                stage = "load_depth_dsm"
+                from ortholoc.depth import DepthDSM
+
+                depth_dsm = DepthDSM.from_file(self.dsm_path)
 
             stage = "init_matcher"
             logging.info("Localization init: creating matcher %s on %s", self.ortholoc_matcher, self.ortholoc_device)
@@ -1010,13 +1083,24 @@ class DualProcessTask:
             try:
                 camera_up = None
                 world_up = None
-                if self.ortholoc_pnp_prior == "gravity":
+                if self.use_gravity:
                     from ortholoc.gravity import ecef_up
 
                     camera_up = self.gravity_priors[qname]
                     # Local vertical comes from the map origin, NOT ECEF Z or frame GT.
                     map_lon, map_lat, _ = crop_ecef_to_wgs84(*ecef_origin)
                     world_up = ecef_up(map_lon, map_lat)
+                depth_prior = None
+                if self.use_depth:
+                    from ortholoc.depth import DepthPrior
+                    import PIL.Image
+
+                    with PIL.Image.open(img_path) as query_image:
+                        query_width, query_height = query_image.size
+                    depth_prior = DepthPrior(
+                        depth_dsm, ecef_origin, self.depth_priors[qname], intrinsics_matrix,
+                        query_width, query_height,
+                        diagnostic_dir=os.path.join(self.outputs, "pnp_failures"), image_name=qname)
                 ortho_ret = run_ortholoc_localization_on_crop(
                     img_path=img_path,
                     image_dop=dom_warp,
@@ -1032,6 +1116,13 @@ class DualProcessTask:
                     gravity_world_up=world_up,
                     gravity_threshold_deg=self.ortholoc_gravity_threshold_deg,
                     pnp_seed=self.ortholoc_pnp_seed,
+                    depth_prior=depth_prior,
+                    depth_threshold_m=self.ortholoc_depth_threshold_m,
+                    prior_fusion=self.ortholoc_prior_fusion,
+                    gravity_scale_deg=self.ortholoc_gravity_scale_deg,
+                    depth_scale_m=self.ortholoc_depth_scale_m,
+                    gravity_weight=self.ortholoc_gravity_weight,
+                    depth_weight=self.ortholoc_depth_weight,
                 )
 
                 ortho_ret["pose_c2w"] = add_ecef_origin_to_pose(ortho_ret["pose_c2w"], ecef_origin)
@@ -1163,7 +1254,7 @@ class DualProcessTask:
                     prior_trans=render_trans,
                     next_euler=render_euler,
                     next_trans=render_trans,
-                    ortho_ret=ortho_debug_ret,
+                    ortho_ret=ortho_debug_ret if ortho_debug_ret is not None else {"ecef_origin": ecef_origin},
                     ortho_euler=ortho_debug_euler,
                     ortho_trans=ortho_debug_trans,
                     jump_m=ortho_debug_jump_m,
@@ -1174,6 +1265,7 @@ class DualProcessTask:
                         "sample_id": crop_name,
                         "image_path": os.path.abspath(img_path),
                         "pose_w2c": None,
+                        "ecef_origin": ecef_origin.tolist(),
                         "intrinsics": intrinsics_matrix.tolist(),
                         "error": str(exc),
                         "reset_count": reset_count,
@@ -1212,9 +1304,18 @@ class DualProcessTask:
                     "device": self.ortholoc_device,
                     "angles": self.ortholoc_angles,
                     "pnp_prior_mode": self.ortholoc_pnp_prior,
+                    "prior_fusion": self.ortholoc_prior_fusion,
+                    "gravity_scale_deg": self.ortholoc_gravity_scale_deg,
+                    "depth_scale_m": self.ortholoc_depth_scale_m,
+                    "gravity_weight": self.ortholoc_gravity_weight,
+                    "depth_weight": self.ortholoc_depth_weight,
                     "gravity_prior_file": self.ortholoc_gravity_prior_file,
                     "gravity_prior_format": self.ortholoc_gravity_prior_format,
                     "gravity_threshold_deg": self.ortholoc_gravity_threshold_deg,
+                    "depth_prior_file": self.ortholoc_depth_prior_file,
+                    "depth_threshold_m": self.ortholoc_depth_threshold_m,
+                    "depth_type": "z_depth" if self.use_depth else None,
+                    "depth_pixel_convention": "image_center" if self.use_depth else None,
                     "pnp_seed": self.ortholoc_pnp_seed,
                     "poses": aggregated_poses,
                     "failed_images": failed_images,
@@ -1434,14 +1535,28 @@ def parse_args():
         help="OrthoLoC PnP 最多使用多少 2D-3D 对应点，默认不截断"
     )
 
-    parser.add_argument("--ortholoc_pnp_prior", choices=["none", "gravity"], default="none",
-                        help="none 保持原 PnP；gravity 使用重力方向筛选 P3P 候选")
+    parser.add_argument("--ortholoc_pnp_prior", choices=["none", "gravity", "depth", "gravity_depth"], default="none",
+                        help="原 PnP / 重力先验 / 深度-DSM 先验 / 两种先验；融合方式由 prior_fusion 指定")
+    parser.add_argument("--ortholoc_prior_fusion", choices=["hard", "soft", "balanced"], default="hard",
+                        help="hard: 原阈值门控；soft: 旧版候选评分；balanced: 视觉 P3P/MSAC + 先验辅助最终 BA")
+    parser.add_argument("--ortholoc_gravity_scale_deg", type=float, default=10.0,
+                        help="soft/balanced 模式的重力残差尺度（度），不是剔除阈值")
+    parser.add_argument("--ortholoc_depth_scale_m", type=float, default=10.0,
+                        help="soft/balanced 模式的深度-DSM 残差尺度（米），不是剔除阈值")
+    parser.add_argument("--ortholoc_gravity_weight", type=float, default=0.1,
+                        help="soft: 候选分数权重；balanced: 最终 BA 梯度比例参数（默认目标约 0.15），0 为禁用")
+    parser.add_argument("--ortholoc_depth_weight", type=float, default=0.1,
+                        help="soft: 候选分数权重；balanced: 最终 BA 梯度比例参数（默认目标约 0.15），0 为禁用")
     parser.add_argument("--ortholoc_gravity_prior_file", default=None,
                         help="独立先验文件，按完整图像 basename 对齐，不自动使用 GT")
     parser.add_argument("--ortholoc_gravity_prior_format", choices=["roll_pitch", "camera_up"],
                         default="roll_pitch", help="image roll_deg pitch_deg 或 image ux uy uz；必须是相机系先验")
     parser.add_argument("--ortholoc_gravity_threshold_deg", type=float, default=2.0,
-                        help="候选及优化后位姿与重力先验的最大夹角（度）")
+                        help="仅 hard 模式：候选及优化后位姿与重力先验的最大夹角（度）")
+    parser.add_argument("--ortholoc_depth_prior_file", default=None,
+                        help="独立深度先验：image 或深度 npy 路径 + 深度米数，按 basename/stem 对齐")
+    parser.add_argument("--ortholoc_depth_threshold_m", type=float, default=10.0,
+                        help="仅 hard 模式：深度-DSM 高程差绝对值上限（米）；候选及优化后均检查")
     parser.add_argument("--ortholoc_pnp_seed", type=int, default=None,
                         help="可选固定 PnP 点抽样和 PoseLib seed，不影响视觉匹配")
     parser.add_argument("--ortholoc_output_root", default="/media/amax/PS2000/ortholoc",
