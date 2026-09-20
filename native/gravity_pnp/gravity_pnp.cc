@@ -266,7 +266,7 @@ class BalancedRefinement {
     void configure(const CameraPose &initial, const CameraPose &visual_pose) {
         Mat6 H = Mat6::Zero();
         Vec6 gv = Vec6::Zero();
-        visual.accumulate(initial, H, gv);
+        visual.accumulate(visual_pose, H, gv);
         const double visual_norm = gv.norm();
         if (!std::isfinite(visual_norm) || visual_norm < 1e-12)
             return;
@@ -276,10 +276,11 @@ class BalancedRefinement {
             const double error_deg = gravity_angle_deg(visual_pose);
             if (error_deg <= 25.0) {
                 Mat6 prior_H;
-                gravity_system(initial, &gg, &prior_H);
+                gravity_system(visual_pose, &gg, &prior_H);
                 if (gg.norm() > 1e-12) {
                     const double gate = std::clamp(1.0 - (error_deg - 8.0) / 17.0, 0.2, 1.0);
-                    gravity_strength = gravity_target * visual_norm / gg.norm() * gate;
+                    gravity_strength = std::clamp(
+                        gravity_target * visual_norm / gg.norm(), 0.05, 20.0) * gate;
                     gravity_used = true;
                 }
             }
@@ -294,11 +295,12 @@ class BalancedRefinement {
                 depth_skip_reason = "inconsistent_with_visual_pose";
             } else {
                 Mat6 prior_H;
-                if (depth_system(initial, &gd, &prior_H) && gd.norm() > 1e-12) {
+                if (depth_system(visual_pose, &gd, &prior_H) && gd.norm() > 1e-12) {
                     const double gate = std::clamp(1.0 - (std::abs(check) - 4.0) / 16.0, 0.35, 1.0);
                     const double cosine = std::clamp(gv.dot(gd) / (visual_norm * gd.norm()), -1.0, 1.0);
                     const double align = std::clamp((1.0 + cosine) / 2.0, 0.2, 1.0);
-                    depth_strength = depth_target * visual_norm / gd.norm() * gate * align;
+                    depth_strength = std::clamp(
+                        depth_target * visual_norm / gd.norm(), 0.05, 20.0) * gate * align;
                     depth_used = true;
                     depth_skip_reason = "used";
                 } else {
@@ -453,7 +455,6 @@ py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point
         py::gil_scoped_release release;
         stats = ransac(estimator, scaled_opt, &pose);
         if (estimator.generated > estimator.rejected && stats.num_inliers > 3 && estimator.acceptable(pose)) {
-            const CameraPose pre_ba_pose = pose;
             const double sq_threshold = scaled_opt.max_reproj_error * scaled_opt.max_reproj_error;
             get_inliers(pose, calibrated, points3D, sq_threshold, &inliers);
             const double scale = 1.0 / camera.focal();
@@ -488,14 +489,14 @@ py::tuple estimate(const std::vector<Point2D> &points2D, const std::vector<Point
                 BalancedRefinement prior_refiner(inlier2D, inlier3D, norm_camera, bundle_opt.loss_scale,
                                                 camera_up, world_up, use_gravity, depth_evaluator,
                                                 gravity_scale_deg, depth_scale_m, gravity_weight, depth_weight);
-                prior_refiner.configure(pre_ba_pose, visual_pose);
+                prior_refiner.configure(visual_pose, visual_pose);
                 prior_gravity_used = prior_refiner.gravity_used;
                 prior_depth_used = prior_refiner.depth_used;
                 prior_gravity_strength = prior_refiner.gravity_strength;
                 prior_depth_strength = prior_refiner.depth_strength;
                 prior_depth_skip_reason = prior_refiner.depth_skip_reason;
                 if (prior_refiner.active()) {
-                    CameraPose candidate = pre_ba_pose;
+                    CameraPose candidate = visual_pose;
                     BundleOptions prior_opt = bundle_opt;
                     prior_opt.max_iterations = 30;
                     lm_impl(prior_refiner, &candidate, prior_opt);

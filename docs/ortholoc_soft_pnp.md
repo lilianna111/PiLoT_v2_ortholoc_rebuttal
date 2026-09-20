@@ -1,6 +1,40 @@
-# OrthoLoC RoMa：保留 PnP 的重力／深度鲁棒软评分
+# OrthoLoC RoMa：旧版软评分与当前 visual-first balanced PnP
 
-## 实现范围
+> `soft` 是保留的旧版候选重评分模式。Google RoMa 启动脚本当前默认
+> `balanced`：视觉 P3P/MSAC/LO-RANSAC 先确定 pose 和内点，先验仅在最终
+> pose-only BA 中以受限梯度辅助优化；视觉分数或内点数恶化时回退视觉 pose。
+
+## 当前推荐：balanced
+
+```text
+RoMa 2D–3D 对应点
+    → 原始 PoseLib P3P + MSAC + LO-RANSAC（不读取重力／深度）
+    → 原始视觉 BA，得到 visual pose 与 visual inliers
+    → 检查测量可靠性：角度残差 ≤ 25°；深度 DSM 残差有限且 ≤ 20 m
+    → 在同一视觉内点上做视觉 + 可用先验的 pose-only BA
+    → 重新计算全部视觉对应点的 MSAC 和内点数
+    → 内点保留 ≥ 90% 且视觉 MSAC 不恶化超过 5%：接受；否则回退 visual pose
+```
+
+该模式参照 `costs.py` 的思想以梯度范数平衡先验。`gravity_weight`、
+`depth_weight` 的默认 `0.1` 对应每项约 `0.15 × ||g_visual||` 的初始目标，
+两个先验的合成梯度再硬限制为不超过 `0.30 × ||g_visual||`。这是最终 BA 的
+梯度预算，**不是** P3P 候选总分的 30% 配额。深度只更新平移，重力只更新旋转。
+
+运行双先验：
+
+```bash
+bash run_google_roma.sh \
+  --ortholoc_pnp_prior gravity_depth \
+  --ortholoc_prior_fusion balanced \
+  --ortholoc_pnp_seed 0
+```
+
+结果目录为 `RoMa_gravity_depth_balanced`；输出 `poses.json` 的 `pnp_stats` 记录
+`prior_gravity_used`、`prior_depth_used`、`prior_depth_skip_reason`、先验强度、
+优化前后视觉分数／内点数和 `prior_refinement_accepted`。
+
+## 旧版 soft：实现范围
 
 保留原始 PoseLib 2.0.5 的 P3P 求解器、采样器、视觉内点定义、LO-RANSAC 和视觉 BA。
 不新增联合 LM，不把先验加入视觉 BA 的 Jacobian，不直接改写输出高度或 roll/pitch。
@@ -36,7 +70,7 @@ S(T) = V(T) + G(T) + D(T)
 V 在 PoseLib 已有的归一化相机坐标中计算，tau 同步按焦距归一化；不混合像素和角度单位。
 原 MSAC 将视觉离群点及相机后方点计为 tau²，故 V 是对应点数量归一化的截断视觉代价。
 重力沿用已有 roll/pitch → signed camera Up 和世界 Up 的夹角；不新增 yaw 测量。
-深度沿用已核查的绝对 ECEF 恢复、原始 OpenCV K、数组中心相机 Z 深度、DSM 双线性查表。
+深度沿用已核查的绝对 ECEF 恢复、原始 OpenCV K、数组中心相机 Z 深度、DSM 双线性查表。  
 
 rho 复用只读参考项目 costs.py 的 loss_fn1 在 alpha=0、truncate=1 时的核形式。
 代码以对数空间计算，避免极大的有限残差平方溢出后重新变成硬拒绝。
@@ -46,7 +80,7 @@ rho 复用只读参考项目 costs.py 的 loss_fn1 在 alpha=0、truncate=1 时�
 
 | CLI 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `--ortholoc_prior_fusion` | Google RoMa 启动脚本为 soft；直接 main.py 为 hard | 选择鲁棒软评分或旧硬门控 |
+| `--ortholoc_prior_fusion` | Google RoMa 启动脚本为 balanced；直接 main.py 为 hard | 选择 balanced、旧 soft 评分或旧硬门控 |
 | `--ortholoc_gravity_scale_deg` | 10 | 软评分尺度，不是最大允许角度 |
 | `--ortholoc_depth_scale_m` | 10 | 软评分尺度，不是最大允许高程差 |
 | `--ortholoc_gravity_weight` | 0.1 | 重力惩罚强度；0 不参与评分 |

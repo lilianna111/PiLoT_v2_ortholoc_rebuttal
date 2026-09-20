@@ -46,6 +46,12 @@ class NativeSoftPnPTest(unittest.TestCase):
             kwargs.pop("world_up", [0, 0, 1]), 2,
             use_gravity=kwargs.pop("use_gravity", False), prior_fusion="soft", **kwargs)
 
+    def solve_balanced(self, x, X, camera, **kwargs):
+        return self.backend.estimate_absolute_pose(
+            x, X, camera, self.options, kwargs.pop("camera_up", [0, 0, 1]),
+            kwargs.pop("world_up", [0, 0, 1]), 2,
+            use_gravity=kwargs.pop("use_gravity", False), prior_fusion="balanced", **kwargs)
+
     def check_score(self, rt, info, x, X, camera, gravity=True, depth=None):
         self.assertTrue(info["success"])
         visual, mask = visual_score(rt, x, X, camera, self.options)
@@ -168,6 +174,30 @@ class NativeSoftPnPTest(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.solve(x, X, camera, **kwargs)
 
+    def test_balanced_keeps_visual_ransac_selection_when_depth_is_inconsistent(self):
+        x, X, camera, _, _ = synthetic_scene(outliers=20, noise=.2)
+        original, original_info = poselib.estimate_absolute_pose(x, X, camera, self.options, {})
+        rt, info = self.solve_balanced(x, X, camera, depth_evaluator=lambda _: 1000.,
+                                       gravity_weight=0., depth_weight=.1)
+        self.assertTrue(info["success"])
+        self.assertFalse(info["prior_depth_used"])
+        self.assertEqual(info["prior_depth_skip_reason"], "inconsistent_with_visual_pose")
+        self.assertEqual(info["num_inliers"], original_info["num_inliers"])
+        np.testing.assert_allclose(rt, original.Rt, atol=1e-9, rtol=1e-9)
+
+    def test_balanced_zero_weights_exactly_matches_visual_poselib(self):
+        x, X, camera, R, _ = synthetic_scene(outliers=20, noise=.2)
+        original, original_info = poselib.estimate_absolute_pose(x, X, camera, self.options, {})
+        rt, info = self.solve_balanced(
+            x, X, camera, use_gravity=True, camera_up=R @ [0., 0., 1.],
+            depth_evaluator=Mock(side_effect=AssertionError("disabled depth must not be evaluated")),
+            gravity_weight=0., depth_weight=0.)
+        self.assertTrue(info["success"])
+        self.assertFalse(info["prior_gravity_used"])
+        self.assertFalse(info["prior_depth_used"])
+        self.assertEqual(info["num_inliers"], original_info["num_inliers"])
+        np.testing.assert_allclose(rt, original.Rt, atol=1e-9, rtol=1e-9)
+
 
 class SoftIntegrationTest(unittest.TestCase):
     @classmethod
@@ -241,9 +271,9 @@ class SoftIntegrationTest(unittest.TestCase):
 class SoftLauncherTest(unittest.TestCase):
     launch_without_localization = gravity_tests.LauncherConfigTest.launch_without_localization
 
-    def test_google_defaults_to_soft_with_explicit_scales_and_weights(self):
+    def test_google_defaults_to_visual_first_balanced_with_explicit_scales_and_weights(self):
         args = self.launch_without_localization(['--ortholoc_pnp_prior', 'gravity_depth'])
-        self.assertEqual(args.ortholoc_prior_fusion, 'soft')
+        self.assertEqual(args.ortholoc_prior_fusion, 'balanced')
         self.assertEqual(args.ortholoc_gravity_scale_deg, 10.)
         self.assertEqual(args.ortholoc_depth_scale_m, 10.)
         self.assertEqual(args.ortholoc_gravity_weight, .1)

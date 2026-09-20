@@ -1,7 +1,8 @@
 # OrthoLoC RoMa：中心像素深度与 DSM 的 PnP 硬门控
 
-本文记录旧 hard 模式。Google RoMa 启动脚本现默认使用 soft 评分，见
-[软评分说明](ortholoc_soft_pnp.md)。重现本文门控实验必须显式指定 `--ortholoc_prior_fusion hard`。
+本文记录旧 hard 模式。Google RoMa 启动脚本现默认使用 visual-first `balanced`
+优化，见[软评分与 balanced 说明](ortholoc_soft_pnp.md)。重现本文门控实验必须
+显式指定 `--ortholoc_prior_fusion hard`。
 
 ## 1. 本次实现
 
